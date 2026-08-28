@@ -1,0 +1,45 @@
+name: Find Telegram Chat ID
+
+on:
+  workflow_dispatch:
+
+jobs:
+  find-chat-id:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Chat ID ermitteln
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates" > response.json
+
+          python - <<'PY'
+          import json
+
+          with open("response.json") as f:
+              data = json.load(f)
+
+          if not data.get("ok"):
+              print("Telegram API Fehler")
+              raise SystemExit(1)
+
+          updates = data.get("result", [])
+
+          if not updates:
+              print("Keine Nachricht gefunden.")
+              print("Bitte zuerst /start an deinen Bot schicken.")
+              raise SystemExit(1)
+
+          found = set()
+
+          for update in updates:
+              chat = update.get("message", {}).get("chat", {})
+              if chat.get("id") is not None:
+                  found.add(str(chat["id"]))
+
+          print("Gefundene Chat-ID(s):")
+
+          for chat_id in found:
+              print(chat_id)
+          PY
