@@ -1,0 +1,43 @@
+name: Fly4free Feed Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-feed:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Fly4free abrufen
+        run: |
+          python - <<'PY'
+          import urllib.request
+
+          urls = [
+              "https://www.fly4free.com/flight-deals/error-fare/feed/",
+              "https://www.fly4free.com/flight-deals/mistake-fare/feed/",
+              "https://www.fly4free.com/flight-deals/mega/feed/"
+          ]
+
+          for url in urls:
+              print("\n================================")
+              print(url)
+              print("================================")
+
+              try:
+                  request = urllib.request.Request(
+                      url,
+                      headers={"User-Agent": "Mozilla/5.0"}
+                  )
+
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      data = response.read().decode("utf-8", errors="replace")
+
+                  print("HTTP OK")
+                  print("Länge:", len(data))
+                  print(data[:1000])
+
+              except Exception as e:
+                  print("FEHLER:", type(e).__name__)
+                  print(str(e))
+          PY
