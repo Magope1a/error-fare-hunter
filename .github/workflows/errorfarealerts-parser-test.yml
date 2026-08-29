@@ -1,0 +1,165 @@
+name: ErrorFareAlerts Parser Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  parser-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Feed abrufen und Beiträge analysieren
+        run: |
+          python - <<'PY'
+          import urllib.request
+          import re
+          from html import unescape
+
+          URL = "https://t.me/s/errorfarealerts"
+
+          request = urllib.request.Request(
+              URL,
+              headers={"User-Agent": "Mozilla/5.0"}
+          )
+
+          with urllib.request.urlopen(request, timeout=30) as response:
+              html = response.read().decode("utf-8", errors="replace")
+
+          print("HTTP OK")
+          print("HTML-Länge:", len(html))
+          print()
+
+          # Telegram-Seite in einzelne Posts aufteilen
+          posts = re.findall(
+              r'<div class="tgme_widget_message[^>]*data-post="([^"]+)"[^>]*>(.*?)</div>\s*</div>',
+              html,
+              re.S
+          )
+
+          print("Gefundene mögliche Beiträge:", len(posts))
+          print()
+
+          # Falls das HTML anders aufgebaut ist:
+          if not posts:
+              print("Keine Beiträge mit dem ersten Muster gefunden.")
+              print("Suche nach data-post...")
+              
+              ids = re.findall(r'data-post="([^"]+)"', html)
+              print("Gefundene data-post IDs:", len(ids))
+              print(ids[:20])
+              
+              raise SystemExit(0)
+
+          # Nur die neuesten 10 Beiträge untersuchen
+          for number, (post_id, content) in enumerate(posts[-10:], 1):
+
+              text = re.sub(r'<[^>]+>', ' ', content)
+              text = unescape(text)
+              text = re.sub(r'\s+', ' ', text).strip()
+
+              # Preis erkennen
+              prices = re.findall(
+                  r'(?:€|EUR)\s?[\d.,]+|[\d.,]+\s?(?:€|EUR)',
+                  text,
+                  re.I
+              )
+
+              # Kabine erkennen
+              cabins = []
+
+              if re.search(r'\bbusiness\b', text, re.I):
+                  cabins.append("BUSINESS")
+
+              if re.search(r'\bfirst\b', text, re.I):
+                  cabins.append("FIRST")
+
+              if re.search(r'\beconomy\b', text, re.I):
+                  cabins.append("ECONOMY")
+
+              # Regionen
+              asia_words = [
+                  "japan", "tokyo", "osaka", "kyoto",
+                  "thailand", "bangkok", "phuket",
+                  "vietnam", "hanoi", "ho chi minh",
+                  "china", "hong kong", "singapore",
+                  "indonesia", "bali", "malaysia",
+                  "philippines", "manila",
+                  "south korea", "seoul",
+                  "taiwan", "india", "mumbai", "delhi",
+                  "asia"
+              ]
+
+              europe_words = [
+                  "germany", "germany", "deutschland",
+                  "netherlands", "niederlande",
+                  "amsterdam", "düsseldorf",
+                  "duesseldorf", "frankfurt",
+                  "cologne", "köln", "berlin",
+                  "brussels", "brüssel",
+                  "luxembourg"
+              ]
+
+              asia = any(word in text.lower() for word in asia_words)
+              preferred_europe = any(
+                  word in text.lower() for word in europe_words
+              )
+
+              # Preiswerte extrahieren
+              numeric_prices = []
+
+              for price in prices:
+                  numbers = re.findall(r'[\d.,]+', price)
+
+                  for value in numbers:
+                      try:
+                          value = value.replace(".", "").replace(",", ".")
+                          numeric_prices.append(float(value))
+                      except:
+                          pass
+
+              lowest_price = min(numeric_prices) if numeric_prices else None
+
+              # Einfacher vorläufiger Score
+              score = 0
+
+              if lowest_price is not None:
+                  if lowest_price < 150:
+                      score += 35
+                  elif lowest_price < 250:
+                      score += 25
+                  elif lowest_price < 400:
+                      score += 18
+                  elif lowest_price < 600:
+                      score += 10
+
+              if "BUSINESS" in cabins:
+                  score += 30
+
+              if "FIRST" in cabins:
+                  score += 35
+
+              if asia:
+                  score += 20
+
+              if preferred_europe:
+                  score += 10
+
+              score = min(score, 100)
+
+              print("=" * 70)
+              print(f"POST {number}")
+              print("ID:", post_id)
+              print("Preis:", prices if prices else "nicht erkannt")
+              print("Niedrigster Preis:", lowest_price)
+              print("Kabine:", cabins if cabins else "nicht erkannt")
+              print("Asien:", "JA" if asia else "NEIN")
+              print("Bevorzugter Abflug:", "JA" if preferred_europe else "NEIN")
+              print("VORLÄUFIGER SCORE:", score)
+              print()
+              print("TEXT:")
+              print(text[:1000])
+              print()
+
+          print("=" * 70)
+          print("PARSER-TEST ABGESCHLOSSEN")
+          PY
