@@ -1,4 +1,4 @@
-name: ErrorFareAlerts Smart Parser V2
+name: ErrorFareAlerts Smart Parser V3
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Smart Parser V2
+      - name: Smart Parser V3
         run: |
           python - <<'PY'
           import urllib.request
@@ -52,11 +52,11 @@ jobs:
           ]
 
           LONG_HAUL = [
-              "japan", "tokyo", "osaka", "kyoto",
+              "japan", "tokyo", "osaka",
               "south korea", "seoul",
               "china", "beijing", "shanghai",
-              "hong kong", "taiwan", "taipei",
-              "thailand", "bangkok", "phuket",
+              "hong kong", "taiwan",
+              "thailand", "bangkok",
               "vietnam", "hanoi", "ho chi minh",
               "singapore", "malaysia",
               "indonesia", "bali",
@@ -91,6 +91,30 @@ jobs:
               "basel", "prague",
               "budapest", "amsterdam",
               "brussels", "brüssel"
+          ]
+
+          # Wörter, die NICHT als Error-Fare-Signal zählen
+          GENERIC_ERROR_TEXT = [
+              "error fares are price errors",
+              "our algorithm detects error fares",
+              "notifies you immediately",
+              "sign up for free now",
+              "errorfarealerts",
+              "errorfarealerts.com"
+          ]
+
+          ERROR_SIGNALS = [
+              "error fare",
+              "errorfare",
+              "mistake fare",
+              "mistake-fare",
+              "pricing mistake",
+              "price error",
+              "pricing error",
+              "fehlerpreis",
+              "preisfehler",
+              "preisfehler!",
+              "price mistake"
           ]
 
           def clean_text(content):
@@ -134,208 +158,205 @@ jobs:
               if re.search(r'\bbusiness class\b|\bbusiness-class\b', t):
                   return "BUSINESS"
 
-              if re.search(r'\beconomy class\b|\beconomy-class\b|\beconomy\b', t):
+              if re.search(
+                  r'\beconomy class\b|\beconomy-class\b|\beconomy\b',
+                  t
+              ):
                   return "ECONOMY"
 
               return "UNKNOWN"
 
-          def actual_error_signal(text):
-              """
-              Nur nach konkreten Error-Fare-Hinweisen suchen.
-              Den allgemeinen Website-Satz 'Error Fares are price errors...'
-              NICHT berücksichtigen.
-              """
-
+          def detect_real_error(text):
               t = text.lower()
 
-              # Allgemeiner EFA-Erklärungstext entfernen
-              generic = [
-                  "error fares are price errors in travel deals",
-                  "our algorithm detects error fares",
-                  "notifies you immediately",
-                  "sign up for free now"
-              ]
-
-              for phrase in generic:
+              # Quellen-/Footertext entfernen
+              for phrase in GENERIC_ERROR_TEXT:
                   t = t.replace(phrase, "")
 
-              signals = [
-                  "error fare",
-                  "errorfare",
-                  "mistake fare",
-                  "mistake",
-                  "pricing mistake",
-                  "price error",
-                  "fehlerpreis",
-                  "preisfehler"
-              ]
-
-              return any(signal in t for signal in signals)
+              # Nur noch im bereinigten Text suchen
+              return any(signal in t for signal in ERROR_SIGNALS)
 
           def score_deal(text, price, cabin):
 
               t = text.lower()
 
+              if "newsletter" in t:
+                  return 0, ["Newsletter"], "IGNORE"
+
               asia = any(x in t for x in ASIA)
               long_haul = any(x in t for x in LONG_HAUL)
               preferred = any(x in t for x in PREFERRED)
               short_haul = any(x in t for x in SHORT_HAUL)
-              explicit_error = actual_error_signal(text)
+
+              real_error = detect_real_error(text)
 
               score = 0
               reasons = []
 
-              # Newsletter niemals bewerten
-              if "newsletter" in t:
-                  return 0, ["Newsletter"], "IGNORE"
+              # ==========================================
+              # BUSINESS
+              # ==========================================
 
-              # ------------------------------------------------
-              # EXTREM NIEDRIGER PREIS
-              # ------------------------------------------------
+              if cabin == "BUSINESS" and price is not None:
 
-              if price is not None:
+                  if asia:
+                      if price < 400:
+                          score += 60
+                          reasons.append("Business Asien <400€")
+                      elif price < 500:
+                          score += 50
+                          reasons.append("Business Asien <500€")
+                      elif price < 650:
+                          score += 38
+                          reasons.append("Business Asien <650€")
+                      elif price < 800:
+                          score += 25
+                          reasons.append("Business Asien <800€")
 
-                  if cabin == "BUSINESS":
-
-                      if asia:
-                          if price < 400:
-                              score += 60
-                              reasons.append("Business Asien <400€")
-                          elif price < 500:
-                              score += 50
-                              reasons.append("Business Asien <500€")
-                          elif price < 650:
-                              score += 38
-                              reasons.append("Business Asien <650€")
-                          elif price < 800:
-                              score += 25
-                              reasons.append("Business Asien <800€")
-
-                      elif long_haul:
-                          if price < 400:
-                              score += 55
-                              reasons.append("Long-Haul Business <400€")
-                          elif price < 500:
-                              score += 45
-                              reasons.append("Long-Haul Business <500€")
-                          elif price < 650:
-                              score += 30
-                              reasons.append("Long-Haul Business <650€")
-
-                      elif short_haul:
-                          if price < 150:
-                              score += 15
-                              reasons.append("extrem günstige Kurzstrecke")
-
-                      else:
-                          if price < 300:
-                              score += 25
-
-                  elif cabin == "FIRST":
-
-                      if asia and price < 900:
-                          score += 65
-                          reasons.append("First Asien <900€")
-                      elif long_haul and price < 800:
+                  elif long_haul:
+                      if price < 400:
                           score += 55
-                          reasons.append("Long-Haul First <800€")
+                          reasons.append("Long-Haul Business <400€")
                       elif price < 500:
                           score += 45
+                          reasons.append("Long-Haul Business <500€")
+                      elif price < 650:
+                          score += 30
+                          reasons.append("Long-Haul Business <650€")
 
-                  elif cabin == "ECONOMY":
+                  elif short_haul:
+                      # Kurzstrecke nicht als Error Fare pushen
+                      if price < 150:
+                          score += 5
 
-                      if asia:
-                          if price < 150:
-                              score += 60
-                              reasons.append("Economy Asien <150€")
-                          elif price < 200:
-                              score += 50
-                              reasons.append("Economy Asien <200€")
-                          elif price < 250:
-                              score += 40
-                              reasons.append("Economy Asien <250€")
-                          elif price < 300:
-                              score += 30
-                              reasons.append("Economy Asien <300€")
-                          elif price < 400:
-                              score += 15
+              # ==========================================
+              # FIRST
+              # ==========================================
 
-                      elif long_haul:
-                          if price < 150:
-                              score += 50
-                              reasons.append("Long-Haul Economy <150€")
-                          elif price < 200:
-                              score += 40
-                              reasons.append("Long-Haul Economy <200€")
-                          elif price < 250:
-                              score += 30
-                              reasons.append("Long-Haul Economy <250€")
-                          elif price < 300:
-                              score += 20
+              elif cabin == "FIRST" and price is not None:
 
-                      elif short_haul:
-                          # Mallorca/London/etc. nicht als Error-Fare pushen
-                          if price < 40:
-                              score += 10
+                  if asia and price < 900:
+                      score += 65
+                      reasons.append("First Asien <900€")
 
-                  else:
-                      # unbekannte Kabine
-                      if long_haul and price < 200:
-                          score += 25
+                  elif long_haul and price < 800:
+                      score += 55
+                      reasons.append("Long-Haul First <800€")
 
-              # ------------------------------------------------
-              # ASIEN
-              # ------------------------------------------------
+                  elif price < 500:
+                      score += 45
+                      reasons.append("First <500€")
+
+              # ==========================================
+              # ECONOMY
+              # ==========================================
+
+              elif cabin == "ECONOMY" and price is not None:
+
+                  if asia:
+
+                      if price < 150:
+                          score += 60
+                          reasons.append("Economy Asien <150€")
+
+                      elif price < 200:
+                          score += 50
+                          reasons.append("Economy Asien <200€")
+
+                      elif price < 250:
+                          score += 40
+                          reasons.append("Economy Asien <250€")
+
+                      elif price < 300:
+                          score += 30
+                          reasons.append("Economy Asien <300€")
+
+                      elif price < 400:
+                          score += 15
+
+                  elif long_haul:
+
+                      if price < 150:
+                          score += 50
+                          reasons.append("Long-Haul Economy <150€")
+
+                      elif price < 200:
+                          score += 40
+                          reasons.append("Long-Haul Economy <200€")
+
+                      elif price < 250:
+                          score += 30
+                          reasons.append("Long-Haul Economy <250€")
+
+                      elif price < 300:
+                          score += 20
+
+                  elif short_haul:
+
+                      # Europa-Kurzstrecke nur bei extremem Preis interessant
+                      if price < 40:
+                          score += 10
+
+              # ==========================================
+              # UNKNOWN CABIN
+              # ==========================================
+
+              elif price is not None:
+
+                  if long_haul and price < 200:
+                      score += 25
+                      reasons.append("Long-Haul sehr günstig")
+
+              # ==========================================
+              # BONUS
+              # ==========================================
 
               if asia:
                   score += 15
                   reasons.append("Asien")
 
-              # ------------------------------------------------
-              # BEVORZUGTER ABFLUG
-              # ------------------------------------------------
-
               if preferred:
                   score += 5
                   reasons.append("DE/NL/BE/LUX-Abflug")
 
-              # ------------------------------------------------
-              # KONKRETER ERROR-FARE-HINWEIS
-              # ------------------------------------------------
+              # ==========================================
+              # ECHTER ERROR-FARE-HINWEIS
+              # ==========================================
 
-              if explicit_error:
+              if real_error:
                   score += 25
-                  reasons.append("konkreter Error-Fare-Hinweis")
+                  reasons.append("echter Error-Fare-Hinweis")
 
-              # ------------------------------------------------
-              # NORMALE KURZSTRECKE EXTRA DÄMPFEN
-              # ------------------------------------------------
-
+              # Kurzstrecken-Deals abwerten
               if short_haul and not long_haul:
                   score -= 20
 
               score = max(0, min(score, 100))
 
-              # ------------------------------------------------
+              # ==========================================
               # KLASSIFIZIERUNG
-              # ------------------------------------------------
+              # ==========================================
 
               if score >= 85:
                   classification = "🚨 EXTREMER ERROR FARE"
+
               elif score >= 70:
                   classification = "🔥 SEHR STARK"
+
               elif score >= 55:
                   classification = "🟡 STARKER DEAL"
+
               elif score >= 40:
                   classification = "🔵 INTERESSANT"
+
               else:
                   classification = "❌ IGNORIEREN"
 
               return score, reasons, classification
 
-          # ----------------------------------------------------
-          # TEST
-          # ----------------------------------------------------
+          # ==============================================
+          # AUSWERTUNG
+          # ==============================================
 
           for number, (post_id, content) in enumerate(posts[-15:], 1):
 
@@ -363,5 +384,5 @@ jobs:
               print()
 
           print("=" * 80)
-          print("SMART-PARSER V2 TEST ABGESCHLOSSEN")
+          print("SMART-PARSER V3 TEST ABGESCHLOSSEN")
           PY
