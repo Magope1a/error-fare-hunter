@@ -1,27 +1,18 @@
 name: Error Fare Hunter
 
 on:
- workflow_dispatch:
-  inputs:
-    test_latest:
-      description: "Aktuelle Beiträge testen"
-      required: false
-      default: "0"
-      type: choice
-      options:
-        - "0"
-        - "1"
+  workflow_dispatch:
+    inputs:
+      test_telegram:
+        description: "Telegram-Verbindung testen"
+        required: true
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"
 
-    test_telegram:
-      description: "Telegram-Verbindung testen"
-      required: false
-      default: "0"
-      type: choice
-      options:
-        - "0"
-        - "1"
   schedule:
-    # Schnellstmöglicher GitHub-Schedule: alle 5 Minuten, leicht versetzt.
     - cron: "2-59/5 * * * *"
 
 permissions:
@@ -42,17 +33,99 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Scanner starten
+      - name: Telegram Verbindung testen
+        if: ${{ inputs.test_telegram == '1' }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TEST_LATEST: ${{ inputs.test_latest || '0' }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+
+          token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+          chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
+          print("Bot-Token vorhanden:", bool(token))
+          print("Chat-ID vorhanden:", bool(chat_id))
+
+          if not token:
+              raise SystemExit("FEHLER: TELEGRAM_BOT_TOKEN fehlt")
+
+          if not chat_id:
+              raise SystemExit("FEHLER: TELEGRAM_CHAT_ID fehlt")
+
+          # Bot selbst prüfen
+          url = f"https://api.telegram.org/bot{token}/getMe"
+
+          with urllib.request.urlopen(
+              urllib.request.Request(url),
+              timeout=20
+          ) as response:
+              result = json.loads(
+                  response.read().decode("utf-8")
+              )
+
+          print("getMe:", result)
+
+          if not result.get("ok"):
+              raise SystemExit("FEHLER: Bot-Token ist ungültig")
+
+          bot_name = result["result"].get("username", "?")
+          print("Bot:", bot_name)
+
+          # Nachricht senden
+          send_url = (
+              f"https://api.telegram.org/bot{token}/sendMessage"
+          )
+
+          data = urllib.parse.urlencode({
+              "chat_id": chat_id,
+              "text": (
+                  "✅ ERROR FARE HUNTER\n\n"
+                  "Telegram-Verbindung funktioniert.\n"
+                  "Bot, Chat-ID und Telegram API wurden erfolgreich getestet."
+              )
+          }).encode("utf-8")
+
+          request = urllib.request.Request(
+              send_url,
+              data=data,
+              method="POST"
+          )
+
+          with urllib.request.urlopen(
+              request,
+              timeout=20
+          ) as response:
+              result = json.loads(
+                  response.read().decode("utf-8")
+              )
+
+          print("sendMessage:", result)
+
+          if not result.get("ok"):
+              raise SystemExit(
+                  "FEHLER: Telegram hat die Nachricht nicht akzeptiert"
+              )
+
+          print("TELEGRAM-TEST ERFOLGREICH")
+          PY
+
+      - name: Scanner starten
+        if: ${{ inputs.test_telegram != '1' }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python scanner.py
 
       - name: Scanner-Status speichern
+        if: ${{ inputs.test_telegram != '1' }}
         run: |
           git config user.name "Error Fare Hunter Bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .errorfare_hunter_state.json
-          git diff --cached --quiet || git commit -m "Update Error Fare Hunter state"
+          git add .errorfare_state.json
+          git diff --cached --quiet || git commit -m "Update scanner state"
           git push
