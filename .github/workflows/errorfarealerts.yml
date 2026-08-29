@@ -1,16 +1,25 @@
 name: Error Fare Hunter
 
 on:
-  workflow_dispatch:
-    inputs:
-      test_latest:
-        description: "Aktuelle Quellen einmal prüfen; maximal 1 Testalarm senden"
-        required: false
-        default: "0"
-        type: choice
-        options:
-          - "0"
-          - "1"
+ workflow_dispatch:
+  inputs:
+    test_latest:
+      description: "Aktuelle Beiträge testen"
+      required: false
+      default: "0"
+      type: choice
+      options:
+        - "0"
+        - "1"
+
+    test_telegram:
+      description: "Telegram-Verbindung testen"
+      required: false
+      default: "0"
+      type: choice
+      options:
+        - "0"
+        - "1"
   schedule:
     # Schnellstmöglicher GitHub-Schedule: alle 5 Minuten, leicht versetzt.
     - cron: "2-59/5 * * * *"
