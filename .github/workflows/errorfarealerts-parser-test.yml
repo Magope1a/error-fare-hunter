@@ -1,4 +1,4 @@
-name: ErrorFareAlerts Parser Test
+name: ErrorFareAlerts Smart Parser Test
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Feed abrufen und Beiträge analysieren
+      - name: Smart Parser
         run: |
           python - <<'PY'
           import urllib.request
@@ -27,139 +27,274 @@ jobs:
 
           print("HTTP OK")
           print("HTML-Länge:", len(html))
-          print()
 
-          # Telegram-Seite in einzelne Posts aufteilen
           posts = re.findall(
               r'<div class="tgme_widget_message[^>]*data-post="([^"]+)"[^>]*>(.*?)</div>\s*</div>',
               html,
               re.S
           )
 
-          print("Gefundene mögliche Beiträge:", len(posts))
+          print("Beiträge gefunden:", len(posts))
           print()
 
-          # Falls das HTML anders aufgebaut ist:
-          if not posts:
-              print("Keine Beiträge mit dem ersten Muster gefunden.")
-              print("Suche nach data-post...")
-              
-              ids = re.findall(r'data-post="([^"]+)"', html)
-              print("Gefundene data-post IDs:", len(ids))
-              print(ids[:20])
-              
-              raise SystemExit(0)
+          ASIA = [
+              "japan", "tokyo", "osaka", "kyoto",
+              "south korea", "seoul",
+              "china", "beijing", "shanghai",
+              "hong kong", "taiwan", "taipei",
+              "thailand", "bangkok", "phuket",
+              "vietnam", "hanoi", "ho chi minh",
+              "singapore", "malaysia", "kuala lumpur",
+              "indonesia", "bali", "jakarta",
+              "philippines", "manila",
+              "india", "mumbai", "delhi",
+              "asia"
+          ]
 
-          # Nur die neuesten 10 Beiträge untersuchen
-          for number, (post_id, content) in enumerate(posts[-10:], 1):
+          PREFERRED_DEPARTURES = [
+              "düsseldorf", "duesseldorf", "dus",
+              "köln", "cologne", "cgn",
+              "frankfurt", "fra",
+              "berlin", "ber",
+              "hamburg", "ham",
+              "münchen", "munich", "muc",
+              "amsterdam", "ams",
+              "eindhoven", "ein",
+              "brussels", "brüssel", "bru",
+              "luxembourg", "lux"
+          ]
+
+          EUROPE = [
+              "germany", "deutschland",
+              "netherlands", "niederlande",
+              "france", "spain", "italy",
+              "belgium", "belgien",
+              "switzerland", "austria",
+              "portugal", "uk"
+          ]
+
+          EXTREME_ERROR_WORDS = [
+              "error fare",
+              "errorfare",
+              "mistake fare",
+              "mistake",
+              "price error",
+              "pricing error",
+              "fehlerpreis"
+          ]
+
+          NORMAL_DEAL_WORDS = [
+              "deal",
+              "preiskracher",
+              "last-minute",
+              "angebot"
+          ]
+
+          def extract_price(text):
+              matches = re.findall(
+                  r'(?:€|EUR)\s?([\d.,]+)|([\d.,]+)\s?(?:€|EUR)',
+                  text,
+                  re.I
+              )
+
+              prices = []
+
+              for a, b in matches:
+                  value = a or b
+
+                  try:
+                      # Deutsche Schreibweise berücksichtigen
+                      if "," in value and "." in value:
+                          value = value.replace(".", "").replace(",", ".")
+                      elif "," in value:
+                          value = value.replace(",", ".")
+                      elif value.count(".") > 1:
+                          value = value.replace(".", "")
+
+                      prices.append(float(value))
+                  except:
+                      pass
+
+              return min(prices) if prices else None
+
+          def detect_cabin(text):
+              text = text.lower()
+
+              if re.search(r'\bfirst class\b|\bfirst\b', text):
+                  return "FIRST"
+
+              if re.search(r'\bbusiness class\b|\bbusiness\b', text):
+                  return "BUSINESS"
+
+              if re.search(r'\beconomy class\b|\beconomy\b', text):
+                  return "ECONOMY"
+
+              return "UNKNOWN"
+
+          def calculate_score(text, price, cabin):
+              lower = text.lower()
+
+              score = 0
+              reasons = []
+
+              asia = any(x in lower for x in ASIA)
+              preferred = any(x in lower for x in PREFERRED_DEPARTURES)
+              europe = any(x in lower for x in EUROPE)
+              explicit_error = any(x in lower for x in EXTREME_ERROR_WORDS)
+
+              # -------------------------
+              # PREIS
+              # -------------------------
+
+              if price is not None:
+
+                  if cabin == "BUSINESS":
+
+                      if asia:
+                          if price < 400:
+                              score += 55
+                              reasons.append("Business Asien <400€")
+                          elif price < 600:
+                              score += 42
+                              reasons.append("Business Asien <600€")
+                          elif price < 800:
+                              score += 28
+                              reasons.append("Business Asien <800€")
+                          elif price < 1000:
+                              score += 15
+
+                      else:
+                          if price < 250:
+                              score += 40
+                              reasons.append("Business <250€")
+                          elif price < 400:
+                              score += 32
+                              reasons.append("Business <400€")
+                          elif price < 600:
+                              score += 20
+                              reasons.append("Business <600€")
+
+                  elif cabin == "FIRST":
+
+                      if asia and price < 900:
+                          score += 55
+                          reasons.append("First Asien <900€")
+                      elif price < 600:
+                          score += 45
+                          reasons.append("First <600€")
+                      elif price < 1000:
+                          score += 25
+
+                  elif cabin == "ECONOMY":
+
+                      if asia:
+                          if price < 150:
+                              score += 55
+                              reasons.append("Economy Asien <150€")
+                          elif price < 200:
+                              score += 45
+                              reasons.append("Economy Asien <200€")
+                          elif price < 300:
+                              score += 30
+                              reasons.append("Economy Asien <300€")
+                          elif price < 400:
+                              score += 15
+
+                      else:
+                          if price < 100:
+                              score += 40
+                              reasons.append("Economy <100€")
+                          elif price < 150:
+                              score += 30
+                              reasons.append("Economy <150€")
+                          elif price < 200:
+                              score += 20
+
+                  else:
+                      # unbekannte Kabine
+                      if price < 150:
+                          score += 25
+                      elif price < 250:
+                          score += 15
+
+              # -------------------------
+              # REGION
+              # -------------------------
+
+              if asia:
+                  score += 15
+                  reasons.append("Asien")
+
+              if preferred:
+                  score += 10
+                  reasons.append("bevorzugter Abflug")
+
+              # -------------------------
+              # EXPLIZITER ERROR-FARE-HINWEIS
+              # -------------------------
+
+              if explicit_error:
+                  score += 20
+                  reasons.append("expliziter Error-Fare-Hinweis")
+
+              # -------------------------
+              # NORMAL-DEAL-DÄMPFUNG
+              # -------------------------
+
+              if not explicit_error and any(
+                  word in lower for word in NORMAL_DEAL_WORDS
+              ):
+                  score -= 10
+
+              return max(0, min(score, 100)), reasons, asia, preferred, europe, explicit_error
+
+          # -------------------------
+          # AUSWERTUNG
+          # -------------------------
+
+          for number, (post_id, content) in enumerate(posts[-15:], 1):
 
               text = re.sub(r'<[^>]+>', ' ', content)
               text = unescape(text)
               text = re.sub(r'\s+', ' ', text).strip()
 
-              # Preis erkennen
-              prices = re.findall(
-                  r'(?:€|EUR)\s?[\d.,]+|[\d.,]+\s?(?:€|EUR)',
-                  text,
-                  re.I
+              price = extract_price(text)
+              cabin = detect_cabin(text)
+
+              score, reasons, asia, preferred, europe, explicit_error = calculate_score(
+                  text, price, cabin
               )
 
-              # Kabine erkennen
-              cabins = []
+              # Newsletter komplett ignorieren
+              is_newsletter = "newsletter" in text.lower()
 
-              if re.search(r'\bbusiness\b', text, re.I):
-                  cabins.append("BUSINESS")
-
-              if re.search(r'\bfirst\b', text, re.I):
-                  cabins.append("FIRST")
-
-              if re.search(r'\beconomy\b', text, re.I):
-                  cabins.append("ECONOMY")
-
-              # Regionen
-              asia_words = [
-                  "japan", "tokyo", "osaka", "kyoto",
-                  "thailand", "bangkok", "phuket",
-                  "vietnam", "hanoi", "ho chi minh",
-                  "china", "hong kong", "singapore",
-                  "indonesia", "bali", "malaysia",
-                  "philippines", "manila",
-                  "south korea", "seoul",
-                  "taiwan", "india", "mumbai", "delhi",
-                  "asia"
-              ]
-
-              europe_words = [
-                  "germany", "germany", "deutschland",
-                  "netherlands", "niederlande",
-                  "amsterdam", "düsseldorf",
-                  "duesseldorf", "frankfurt",
-                  "cologne", "köln", "berlin",
-                  "brussels", "brüssel",
-                  "luxembourg"
-              ]
-
-              asia = any(word in text.lower() for word in asia_words)
-              preferred_europe = any(
-                  word in text.lower() for word in europe_words
-              )
-
-              # Preiswerte extrahieren
-              numeric_prices = []
-
-              for price in prices:
-                  numbers = re.findall(r'[\d.,]+', price)
-
-                  for value in numbers:
-                      try:
-                          value = value.replace(".", "").replace(",", ".")
-                          numeric_prices.append(float(value))
-                      except:
-                          pass
-
-              lowest_price = min(numeric_prices) if numeric_prices else None
-
-              # Einfacher vorläufiger Score
-              score = 0
-
-              if lowest_price is not None:
-                  if lowest_price < 150:
-                      score += 35
-                  elif lowest_price < 250:
-                      score += 25
-                  elif lowest_price < 400:
-                      score += 18
-                  elif lowest_price < 600:
-                      score += 10
-
-              if "BUSINESS" in cabins:
-                  score += 30
-
-              if "FIRST" in cabins:
-                  score += 35
-
-              if asia:
-                  score += 20
-
-              if preferred_europe:
-                  score += 10
-
-              score = min(score, 100)
-
-              print("=" * 70)
+              print("=" * 80)
               print(f"POST {number}")
               print("ID:", post_id)
-              print("Preis:", prices if prices else "nicht erkannt")
-              print("Niedrigster Preis:", lowest_price)
-              print("Kabine:", cabins if cabins else "nicht erkannt")
+              print("Preis:", f"{price:.0f} €" if price is not None else "nicht erkannt")
+              print("Kabine:", cabin)
               print("Asien:", "JA" if asia else "NEIN")
-              print("Bevorzugter Abflug:", "JA" if preferred_europe else "NEIN")
-              print("VORLÄUFIGER SCORE:", score)
-              print()
-              print("TEXT:")
-              print(text[:1000])
+              print("Bevorzugter Abflug:", "JA" if preferred else "NEIN")
+              print("Expliziter Error-Fare-Hinweis:", "JA" if explicit_error else "NEIN")
+              print("Newsletter:", "JA" if is_newsletter else "NEIN")
+              print("SCORE:", score)
+              print("GRÜNDE:", ", ".join(reasons) if reasons else "keine")
+
+              if is_newsletter:
+                  classification = "IGNORIEREN – NEWSLETTER"
+              elif score >= 80:
+                  classification = "🚨 EXTREMER ERROR FARE"
+              elif score >= 65:
+                  classification = "🔥 SEHR STARK"
+              elif score >= 50:
+                  classification = "🟡 INTERESSANT"
+              else:
+                  classification = "❌ IGNORIEREN"
+
+              print("KLASSIFIZIERUNG:", classification)
+              print("TEXT:", text[:900])
               print()
 
-          print("=" * 70)
-          print("PARSER-TEST ABGESCHLOSSEN")
+          print("=" * 80)
+          print("SMART-PARSER-TEST ABGESCHLOSSEN")
           PY
