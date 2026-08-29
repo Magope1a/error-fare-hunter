@@ -1,0 +1,21 @@
+name: Telegram Push Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  send-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Testnachricht senden
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          RESPONSE=$(curl -s -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=🚨 ERROR FARE HUNTER – TEST 🚨%0A%0ADein persönlicher Telegram-Alarm funktioniert! ✅%0A%0ADie Verbindung zwischen GitHub und Telegram steht.%0A%0AAls Nächstes bauen wir den eigentlichen Error-Fare-Scanner. 🌍✈️")
+
+          echo "$RESPONSE" | grep -q '"ok":true' && echo "Telegram-Nachricht erfolgreich gesendet." || (echo "Telegram-Nachricht konnte nicht gesendet werden." && exit 1)
