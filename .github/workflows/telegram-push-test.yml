@@ -8,14 +8,52 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Testnachricht senden
+      - name: Telegram Push senden
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          RESPONSE=$(curl -s -X POST \
-            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=🚨 ERROR FARE HUNTER – TEST 🚨%0A%0ADein persönlicher Telegram-Alarm funktioniert! ✅%0A%0ADie Verbindung zwischen GitHub und Telegram steht.%0A%0AAls Nächstes bauen wir den eigentlichen Error-Fare-Scanner. 🌍✈️")
+          python - <<'PY'
+          import os
+          import json
+          import urllib.request
+          import urllib.parse
 
-          echo "$RESPONSE" | grep -q '"ok":true' && echo "Telegram-Nachricht erfolgreich gesendet." || (echo "Telegram-Nachricht konnte nicht gesendet werden." && exit 1)
+          token = os.environ["TELEGRAM_BOT_TOKEN"].strip()
+          chat_id = os.environ["TELEGRAM_CHAT_ID"].strip()
+
+          message = """🚨 ERROR FARE HUNTER – TEST 🚨
+
+          Dein persönlicher Telegram-Alarm funktioniert! ✅
+
+          Die Verbindung zwischen GitHub und Telegram steht.
+
+          Als Nächstes bauen wir den eigentlichen Error-Fare-Scanner. 🌍✈️"""
+
+          url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+          data = urllib.parse.urlencode({
+              "chat_id": chat_id,
+              "text": message
+          }).encode("utf-8")
+
+          try:
+              request = urllib.request.Request(url, data=data, method="POST")
+
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  result = json.loads(response.read().decode("utf-8"))
+
+              if result.get("ok"):
+                  print("TELEGRAM PUSH ERFOLGREICH ✅")
+              else:
+                  print("Telegram hat die Nachricht abgelehnt.")
+                  print("Fehlercode:", result.get("error_code"))
+                  print("Beschreibung:", result.get("description"))
+                  raise SystemExit(1)
+
+          except Exception as error:
+              print("Telegram Push fehlgeschlagen.")
+              print("Fehlertyp:", type(error).__name__)
+              print("Details:", str(error))
+              raise SystemExit(1)
+          PY
