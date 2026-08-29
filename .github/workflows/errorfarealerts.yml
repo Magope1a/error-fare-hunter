@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       test_latest:
-        description: "Einmalig die aktuellen Beiträge testen (sendet höchstens 1 Testalarm)"
+        description: "Aktuelle Quellen einmal prüfen; maximal 1 Testalarm senden"
         required: false
         default: "0"
         type: choice
@@ -12,7 +12,7 @@ on:
           - "0"
           - "1"
   schedule:
-    # Alle 5 Minuten, absichtlich um 2 Minuten versetzt.
+    # Schnellstmöglicher GitHub-Schedule: alle 5 Minuten, leicht versetzt.
     - cron: "2-59/5 * * * *"
 
 permissions:
@@ -44,6 +44,6 @@ jobs:
         run: |
           git config user.name "Error Fare Hunter Bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .errorfare_state.json
-          git diff --cached --quiet || git commit -m "Update scanner state"
+          git add .errorfare_hunter_state.json
+          git diff --cached --quiet || git commit -m "Update Error Fare Hunter state"
           git push
