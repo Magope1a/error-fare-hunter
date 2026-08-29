@@ -5,12 +5,20 @@ on:
   schedule:
     - cron: "*/5 * * * *"
 
+permissions:
+  contents: write
+
 jobs:
   scanner:
     runs-on: ubuntu-latest
 
     steps:
-      - name: ErrorFareAlerts Smart Scanner
+      - name: Repository laden
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: ErrorFareAlerts Scanner
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -21,9 +29,9 @@ jobs:
           import re
           import os
           import json
-          from html import unescape
 
           URL = "https://t.me/s/errorfarealerts"
+          SENT_FILE = ".errorfarealerts_sent"
 
           request = urllib.request.Request(
               URL,
@@ -116,9 +124,8 @@ jobs:
 
           def clean_text(content):
               text = re.sub(r'<[^>]+>', ' ', content)
-              text = unescape(text)
-              text = re.sub(r'\s+', ' ', text).strip()
-              return text
+              text = re.sub(r'\s+', ' ', text)
+              return text.strip()
 
           def extract_price(text):
               matches = re.findall(
@@ -187,222 +194,155 @@ jobs:
               score = 0
               reasons = []
 
-              # ======================================
-              # BUSINESS CLASS
-              # ======================================
-
               if cabin == "BUSINESS" and price is not None:
 
                   if asia:
-
                       if price < 400:
                           score += 80
                           reasons.append("Business Asien <400€")
-
                       elif price < 500:
                           score += 70
                           reasons.append("Business Asien <500€")
-
                       elif price < 600:
                           score += 60
                           reasons.append("Business Asien <600€")
-
                       elif price < 750:
                           score += 45
-                          reasons.append("Business Asien <750€")
-
-                      elif price < 900:
-                          score += 30
 
                   elif long_haul:
-
                       if price < 400:
                           score += 75
                           reasons.append("Long-Haul Business <400€")
-
                       elif price < 500:
                           score += 65
                           reasons.append("Long-Haul Business <500€")
-
                       elif price < 650:
                           score += 50
                           reasons.append("Long-Haul Business <650€")
-
-                      elif price < 800:
-                          score += 30
-
-                  else:
-                      # Europäische Business-Angebote
-                      score += 0
-
-              # ======================================
-              # FIRST CLASS
-              # ======================================
 
               elif cabin == "FIRST" and price is not None:
 
                   if asia and price < 900:
                       score += 80
                       reasons.append("First Asien <900€")
-
                   elif long_haul and price < 800:
                       score += 70
                       reasons.append("Long-Haul First <800€")
-
                   elif price < 600:
                       score += 45
-
-              # ======================================
-              # ECONOMY
-              # ======================================
 
               elif cabin == "ECONOMY" and price is not None:
 
                   if asia:
-
                       if price < 150:
                           score += 80
                           reasons.append("Economy Asien <150€")
-
                       elif price < 200:
                           score += 70
                           reasons.append("Economy Asien <200€")
-
                       elif price < 250:
                           score += 60
                           reasons.append("Economy Asien <250€")
-
                       elif price < 300:
                           score += 50
                           reasons.append("Economy Asien <300€")
-
                       elif price < 350:
                           score += 40
                           reasons.append("Economy Asien <350€")
-
                       elif price < 400:
                           score += 30
                           reasons.append("Economy Asien <400€")
 
-                      elif price < 450:
-                          score += 20
-                          reasons.append("Guter Asienpreis")
-
                   elif long_haul:
-
                       if price < 150:
                           score += 70
                           reasons.append("Long-Haul Economy <150€")
-
                       elif price < 200:
                           score += 60
                           reasons.append("Long-Haul Economy <200€")
-
                       elif price < 250:
                           score += 50
                           reasons.append("Long-Haul Economy <250€")
-
                       elif price < 300:
                           score += 40
                           reasons.append("Long-Haul Economy <300€")
-
                       elif price < 350:
                           score += 25
-
-                  else:
-                      # Europa-Kurzstrecke
-                      score += 0
-
-              # ======================================
-              # UNKNOWN CABIN
-              # ======================================
 
               elif price is not None:
 
                   if asia:
-
                       if price < 200:
                           score += 60
                           reasons.append("Asien <200€")
-
                       elif price < 300:
                           score += 45
                           reasons.append("Asien <300€")
-
                       elif price < 400:
                           score += 30
                           reasons.append("Asien <400€")
 
                   elif long_haul:
-
                       if price < 200:
                           score += 55
                           reasons.append("Long-Haul <200€")
-
                       elif price < 300:
                           score += 40
                           reasons.append("Long-Haul <300€")
-
-              # ======================================
-              # ASIEN BONUS
-              # ======================================
 
               if asia:
                   score += 15
                   reasons.append("Asien")
 
-              # ======================================
-              # BEVORZUGTER ABFLUG
-              # ======================================
-
               if preferred:
                   score += 5
                   reasons.append("DE/NL/BE/LUX-Abflug")
 
-              # ======================================
-              # ERROR-FARE SIGNAL
-              # ======================================
-
               if real_error:
-
                   score += 30
                   reasons.append("konkreter Error-Fare-Hinweis")
-
-              # ======================================
-              # KURZSTRECKE ABWERTEN
-              # ======================================
 
               if short_haul and not long_haul:
                   score -= 30
 
               score = max(0, min(score, 100))
 
-              # ======================================
-              # KLASSIFIZIERUNG
-              # ======================================
-
               if score >= 85:
                   classification = "🚨 EXTREMER ERROR FARE"
-
               elif score >= 70:
                   classification = "🔥 SEHR STARK"
-
               elif score >= 55:
                   classification = "🟡 STARKER DEAL"
-
               elif score >= 35:
                   classification = "🔵 BEOBACHTEN"
-
               else:
                   classification = "❌ IGNORIEREN"
 
               return score, reasons, classification
 
           # ==========================================
-          # SCAN
+          # BEREITS GEMELDETE POSTS LADEN
           # ==========================================
 
-          candidates = []
+          if os.path.exists(SENT_FILE):
+
+              with open(SENT_FILE, "r") as f:
+                  sent_ids = set(
+                      line.strip()
+                      for line in f
+                      if line.strip()
+                  )
+
+          else:
+              sent_ids = set()
+
+          print("Bereits gemeldete IDs:", len(sent_ids))
+
+          new_sent_ids = set()
+
+          # ==========================================
+          # POSTS AUSWERTEN
+          # ==========================================
 
           for post_id, content in posts[-10:]:
 
@@ -428,97 +368,121 @@ jobs:
               print("Klassifizierung:", classification)
               print("Gründe:", ", ".join(reasons))
 
-              # Nur starke Kandidaten an Telegram
+              # Nur neue starke Deals
               if score >= 70:
-                  candidates.append(
-                      (
-                          post_id,
-                          text,
-                          price,
-                          cabin,
-                          score,
-                          reasons,
-                          classification
-                      )
-                  )
 
-          # ==========================================
-          # TELEGRAM
-          # ==========================================
+                  if post_id in sent_ids:
 
-          def send_telegram(message):
+                      print("STATUS: Bereits gemeldet – übersprungen.")
 
-              token = os.environ.get("TELEGRAM_BOT_TOKEN")
-              chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-
-              if not token or not chat_id:
-                  print("FEHLER: Telegram-Secrets fehlen.")
-                  return
-
-              api_url = (
-                  f"https://api.telegram.org/bot{token}/sendMessage"
-              )
-
-              data = urllib.parse.urlencode({
-                  "chat_id": chat_id,
-                  "text": message,
-                  "disable_web_page_preview": "false"
-              }).encode()
-
-              request = urllib.request.Request(
-                  api_url,
-                  data=data,
-                  method="POST"
-              )
-
-              try:
-                  with urllib.request.urlopen(
-                      request,
-                      timeout=20
-                  ) as response:
-
-                      result = json.loads(
-                          response.read().decode("utf-8")
-                      )
-
-                  if result.get("ok"):
-                      print(
-                          "Telegram: Nachricht erfolgreich gesendet."
-                      )
                   else:
-                      print(
-                          "Telegram API Fehler:",
-                          result
-                      )
 
-              except Exception as error:
-                  print(
-                      "Telegram-Verbindungsfehler:",
-                      error
-                  )
+                      print("STATUS: NEUER STARKER DEAL!")
 
-          for (
-              post_id,
-              text,
-              price,
-              cabin,
-              score,
-              reasons,
-              classification
-          ) in candidates:
+                      token = os.environ.get("TELEGRAM_BOT_TOKEN")
+                      chat_id = os.environ.get("TELEGRAM_CHAT_ID")
 
-              message = (
-                  f"{classification}\n\n"
-                  f"💶 Preis: {price:.0f} €\n"
-                  f"✈️ Kabine: {cabin}\n"
-                  f"🌏 Score: {score}/100\n"
-                  f"📍 {', '.join(reasons)}\n\n"
-                  f"{text[:1000]}"
-              )
+                      if token and chat_id:
 
-              send_telegram(message)
+                          message = (
+                              f"{classification}\n\n"
+                              f"💶 Preis: {price:.0f} €\n"
+                              f"✈️ Kabine: {cabin}\n"
+                              f"🌏 Score: {score}/100\n"
+                              f"📍 {', '.join(reasons)}\n\n"
+                              f"{text[:1200]}"
+                          )
+
+                          api_url = (
+                              f"https://api.telegram.org/bot{token}/sendMessage"
+                          )
+
+                          data = urllib.parse.urlencode({
+                              "chat_id": chat_id,
+                              "text": message,
+                              "disable_web_page_preview": "false"
+                          }).encode()
+
+                          request = urllib.request.Request(
+                              api_url,
+                              data=data,
+                              method="POST"
+                          )
+
+                          try:
+
+                              with urllib.request.urlopen(
+                                  request,
+                                  timeout=20
+                              ) as response:
+
+                                  result = json.loads(
+                                      response.read().decode("utf-8")
+                                  )
+
+                              if result.get("ok"):
+
+                                  print(
+                                      "Telegram: erfolgreich gesendet."
+                                  )
+
+                                  new_sent_ids.add(post_id)
+
+                              else:
+
+                                  print(
+                                      "Telegram API Fehler:",
+                                      result
+                                  )
+
+                          except Exception as error:
+
+                              print(
+                                  "Telegram Fehler:",
+                                  error
+                              )
+
+                      else:
+
+                          print(
+                              "FEHLER: Telegram-Secrets fehlen."
+                          )
+
+          # ==========================================
+          # GEMELDETE IDS SPEICHERN
+          # ==========================================
+
+          sent_ids.update(new_sent_ids)
+
+          # Nur die letzten 500 IDs behalten
+          sent_ids = set(list(sent_ids)[-500:])
+
+          with open(SENT_FILE, "w") as f:
+
+              for post_id in sorted(sent_ids):
+                  f.write(post_id + "\n")
 
           print()
           print("=" * 70)
+          print(
+              "Neue Telegram-Meldungen:",
+              len(new_sent_ids)
+          )
+          print(
+              "Gespeicherte IDs:",
+              len(sent_ids)
+          )
           print("LIVE-SCANNER-LAUF ABGESCHLOSSEN")
           PY
+
+      - name: Gemeldete IDs speichern
+        run: |
+          git config user.name "ErrorFareAlerts Bot"
+          git config user.email "actions@github.com"
+
+          git add .errorfarealerts_sent
+
+          git diff --cached --quiet || \
+            git commit -m "Update sent ErrorFareAlerts IDs"
+
+          git push
