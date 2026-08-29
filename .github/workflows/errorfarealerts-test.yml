@@ -1,0 +1,31 @@
+name: ErrorFareAlerts Feed Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-feed:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Öffentlichen Telegram-Feed abrufen
+        run: |
+          python - <<'PY'
+          import urllib.request
+
+          url = "https://t.me/s/errorfarealerts"
+
+          request = urllib.request.Request(
+              url,
+              headers={"User-Agent": "Mozilla/5.0"}
+          )
+
+          with urllib.request.urlopen(request, timeout=20) as response:
+              data = response.read().decode("utf-8", errors="replace")
+
+          print("HTTP OK")
+          print("Feed-Länge:", len(data))
+          print()
+          print("Erste 3000 Zeichen:")
+          print(data[:3000])
+          PY
