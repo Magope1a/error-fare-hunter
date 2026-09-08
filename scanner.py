@@ -188,24 +188,73 @@ def normalize_price_value(value: str) -> float | None:
         return None
 
 
+PRICE_CONTEXT = re.compile(
+    r"(?P<before>.{0,90}?(?:ab|für|fuer|from|starting|only|just| ab|round ?trip|return|hin[- ]? und[- ]? rückflug|hin[- ]?rückflug|one[- ]?way|pro person).{0,90}?)"
+    r"(?:€|EUR)\s*(?P<p1>\d{1,5}(?:[.,]\d{1,2})?)|"
+    r"(?P<before2>.{0,90}?(?:ab|für|fuer|from|starting|only|just|round ?trip|return|hin[- ]? und[- ]? rückflug|hin[- ]?rückflug|one[- ]?way|pro person).{0,90}?)"
+    r"(?P<p2>\d{1,5}(?:[.,]\d{1,2})?)\s*(?:€|EUR)",
+    re.I | re.S,
+)
+
+NEGATIVE_PRICE_CONTEXT = re.compile(
+    r"(?:gepaeck|gepäck|handgepäck|aufgabegepäck|baggage|gebühr|gebuehr|steuer|tax|sitzplatz|seat|aufpreis|extra|pro tag|per day|kind|child|kg|stück|pieces?)",
+    re.I,
+)
+
+def extract_price_candidates(text: str) -> list[tuple[float, int, str]]:
+    candidates: list[tuple[float, int, str]] = []
+    for m in PRICE_CONTEXT.finditer(text):
+        raw = m.group('p1') or m.group('p2')
+        price = normalize_price_value(raw)
+        if price is None or not 10 <= price <= 100000:
+            continue
+        context = (m.group('before') or m.group('before2') or '').strip()
+        score = 10
+        if re.search(r"(?:ab|für|fuer|from|starting|only|just)\s*$", context, re.I):
+            score += 25
+        if re.search(r"(?:round ?trip|return|hin[- ]? und[- ]? rückflug|one[- ]?way|pro person)", context, re.I):
+            score += 20
+        if NEGATIVE_PRICE_CONTEXT.search(context[-70:]):
+            score -= 40
+        candidates.append((price, score, context[-120:]))
+    return candidates
+
+
 def extract_prices(text: str) -> list[float]:
-    patterns = [
-        r"(?:€|EUR)\s*([0-9][0-9.,]*)",
-        r"([0-9][0-9.,]*)\s*(?:€|EUR)",
-        r"ab\s*([0-9][0-9.,]*)\s*(?:Euro|EUR|€)",
-    ]
-    values: list[float] = []
-    for pattern in patterns:
-        for match in re.finditer(pattern, text, flags=re.I):
-            price = normalize_price_value(match.group(1))
-            if price is not None and 1 <= price <= 100000:
-                values.append(price)
-    return sorted(set(values))
+    return sorted({p for p, score, _ in extract_price_candidates(text) if score >= 0})
 
 
 def extract_price(text: str) -> float | None:
-    prices = extract_prices(text)
-    return min(prices) if prices else None
+    candidates = extract_price_candidates(text)
+    if not candidates:
+        return None
+    # Never choose the globally smallest currency amount. Choose the strongest
+    # fare-context candidate first; use the lowest only among equally strong fare prices.
+    best_score = max(score for _, score, _ in candidates)
+    best = [price for price, score, _ in candidates if score == best_score]
+    return min(best)
+
+
+def extract_strong_prices(text: str) -> list[float]:
+    return sorted({price for price, score, _ in extract_price_candidates(text) if score >= 30})
+
+
+def price_conflict(snippet: str, article_text: str) -> tuple[float | None, str]:
+    snippet_prices = extract_strong_prices(snippet)
+    article_prices = extract_strong_prices(article_text)
+    if snippet_prices and article_prices:
+        # If both sources contain fare-context prices and disagree materially,
+        # suppress the candidate rather than trusting an accidental small number.
+        s = min(snippet_prices)
+        a = min(article_prices)
+        if max(s, a) >= 100 and abs(s - a) / max(s, a) >= 0.35:
+            return None, f"PRICE_CONFLICT {s:.0f}€ vs {a:.0f}€"
+        return s, "PRICE_CONSISTENT"
+    if snippet_prices:
+        return min(snippet_prices), "SNIPPET_PRICE"
+    if article_prices:
+        return min(article_prices), "ARTICLE_PRICE"
+    return None, "NO_STRONG_PRICE"
 
 
 def detect_cabin(text: str) -> str:
@@ -644,7 +693,14 @@ def build_deal(item: dict, source_is_error_page: bool = False) -> Deal:
         details.get("stops", ""),
     ])
 
-    price = extract_price(merged)
+    # Price must come from an actual fare phrase, not from arbitrary numbers
+    # anywhere in baggage/metadata/HTML. Compare source snippet and article.
+    price, price_status = price_conflict(item.get("text", ""), article_title + "\n" + merged)
+    if price is None and item.get("article_url"):
+        # Last fallback: title only, still using contextual price parsing.
+        price = extract_price(effective_title)
+        if price is not None:
+            price_status = "TITLE_PRICE"
     cabin = details.get("cabin") or detect_cabin(merged)
     cabin_lower = cabin.lower()
     if cabin_lower.startswith("business"):
@@ -674,6 +730,13 @@ def build_deal(item: dict, source_is_error_page: bool = False) -> Deal:
         cabin,
         explicit_error,
     )
+
+    if price_status == "PRICE_CONFLICT":
+        score = 0
+        level = "❌ IGNORIEREN"
+        reasons.insert(0, "Preis-Konflikt zwischen Quelle und Artikel – kein Alarm")
+    elif price_status in {"SNIPPET_PRICE", "ARTICLE_PRICE", "TITLE_PRICE"}:
+        reasons.insert(0, f"Preisprüfung: {price_status}")
 
     if details.get("origin") and details.get("destination"):
         reasons.append(f"{details['origin']} → {details['destination']}")
