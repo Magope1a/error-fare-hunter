@@ -21,10 +21,16 @@ EFA_CHANNEL = "errorfarealerts"
 EFA_FEED_URL = f"https://t.me/s/{EFA_CHANNEL}"
 SF_ERROR_URL = "https://www.secretflying.com/error-fares/"
 SF_BASE = "https://www.secretflying.com"
+
+# Additional public sources: used for cross-source confirmation, not blind forwarding.
+F4F_MISTAKE_URL = "https://www.fly4free.com/flight-deals/mistake/"
+F4F_GLITCH_URL = "https://www.fly4free.com/flight-deals/ota-glitch/"
+TRAVEL_DEALZ_RSS = "https://travel-dealz.de/feed/"
 STATE_FILE = Path(".errorfare_hunter_state.json")
 
 MAX_EFA_PAGES = 12
 MAX_SF_PAGES = 3
+MAX_AUX_ITEMS = 30
 MAX_ARTICLE_FETCHES = 12
 REQUEST_TIMEOUT = 20
 USER_AGENT = (
@@ -483,6 +489,69 @@ def fetch_sf_recent() -> list[dict]:
             }
     return list(found.values())
 
+
+# ============================================================
+# AUXILIARY PUBLIC SOURCES
+# ============================================================
+
+def extract_feed_items(xml: str, source: str) -> list[dict]:
+    """Small dependency-free RSS parser for public feeds."""
+    items = []
+    for block in re.findall(r"<(?:item|entry)\b.*?</(?:item|entry)>", xml, flags=re.S | re.I):
+        def tag(name: str) -> str:
+            m = re.search(rf"<(?:[A-Za-z0-9_-]+:)?{name}[^>]*>(.*?)</(?:[A-Za-z0-9_-]+:)?{name}>", block, flags=re.S | re.I)
+            return clean_html(html_lib.unescape(m.group(1))) if m else ""
+        title = tag("title")
+        link = ""
+        m = re.search(r'<link[^>]+href=["\']([^"\']+)["\']', block, flags=re.I)
+        if m:
+            link = html_lib.unescape(m.group(1))
+        if not link:
+            link = tag("link") or tag("guid")
+        desc = tag("description") or tag("summary") or tag("content")
+        pub = tag("pubDate") or tag("published") or tag("updated")
+        if title or link:
+            sid = link or title
+            items.append({"source": source, "source_id": sid, "source_url": link or sid,
+                          "article_url": link or None, "text": f"{title}\n{desc}".strip(),
+                          "published_at": pub or None})
+    return items[:MAX_AUX_ITEMS]
+
+
+def fetch_aux_sources() -> list[dict]:
+    found: dict[str, dict] = {}
+    for url, source in ((F4F_MISTAKE_URL, "Fly4Free"), (F4F_GLITCH_URL, "Fly4Free")):
+        try:
+            page = fetch(url)
+            # Fly4free category pages are HTML, so reuse their article links.
+            for href, label in re.findall(r'href="([^"]+)"[^>]*>(.*?)</a>', page, flags=re.S | re.I):
+                href = html_lib.unescape(href)
+                label = clean_html(label)
+                if href.startswith("/"):
+                    href = "https://www.fly4free.com" + href
+                if not href.startswith("https://www.fly4free.com/") or not label:
+                    continue
+                if any(x in href for x in ("/flight-deals/mistake/", "/flight-deals/ota-glitch/", "/category/", "/tag/")):
+                    continue
+                found[href] = {"source": source, "source_id": href, "source_url": href,
+                               "article_url": href, "text": label, "published_at": None}
+        except Exception as exc:
+            print(f"{source} Quelle fehlgeschlagen: {type(exc).__name__}")
+    try:
+        xml = fetch(TRAVEL_DEALZ_RSS)
+        for item in extract_feed_items(xml, "TravelDealz"):
+            found[item["source_id"]] = item
+    except Exception as exc:
+        print(f"Travel-Dealz RSS fehlgeschlagen: {type(exc).__name__}")
+    return list(found.values())[:MAX_AUX_ITEMS]
+
+
+def canonical_deal_key(deal: Deal) -> str:
+    def norm(x: str | None) -> str:
+        return re.sub(r"[^a-z0-9]", "", (x or "").lower())
+    price = round(deal.price or 0)
+    return "|".join((norm(deal.origin), norm(deal.destination), norm(deal.cabin), str(price)))
+
 # ============================================================
 # SCORING
 # ============================================================
@@ -719,6 +788,8 @@ def build_deal(item: dict, source_is_error_page: bool = False) -> Deal:
         item.get("text", "") + "\n" + article_title,
         source_is_error_page=source_is_error_page,
     )
+    if item.get("source") == "Fly4Free" and re.search(r"error\s*fare|mistake|glitch", merged, re.I):
+        explicit_error = True
     region = region_for(merged)
     preferred = has_any(merged, PREFERRED)
     short = has_any(merged, SHORT_HAUL) and region not in LONG_HAUL_REGIONS
@@ -810,6 +881,7 @@ def load_state() -> dict:
             "sf_seen": [],
             "sent_keys": [],
             "pending": {},
+            "sent_deal_keys": [],
         }
     try:
         state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
@@ -828,6 +900,7 @@ def load_state() -> dict:
             "sf_seen": [],
             "sent_keys": [],
             "pending": {},
+            "sent_deal_keys": [],
         }
 
 
@@ -876,8 +949,9 @@ def main(test_latest: bool = False) -> int:
     state = load_state()
     sent = set(str(x) for x in state.get("sent_keys", []))
     pending = state.get("pending", {}) or {}
+    sent_deal_keys = set(str(x) for x in state.get("sent_deal_keys", []))
 
-    print("=== ERROR FARE HUNTER FINAL ===")
+    print("=== ERROR FARE HUNTER V3 ===")
     print(f"Alert-Schwelle: {ALERT_THRESHOLD}")
     print(f"Sofort-Alarm: {URGENT_THRESHOLD}")
 
@@ -902,6 +976,7 @@ def main(test_latest: bool = False) -> int:
         state["initialized"] = True
         state["sent_keys"] = []
         state["pending"] = {}
+        state.setdefault("sent_deal_keys", [])
         save_state(state)
 
         print(f"Erstinitialisierung: EFA-Basis {state['efa_last_seen']}, SF-Basis {len(state['sf_seen'])} Artikel")
@@ -924,6 +999,7 @@ def main(test_latest: bool = False) -> int:
             print(f"TESTALARM: {chosen.key} {chosen.score}/100")
             if send_telegram(format_alert(chosen)):
                 sent.add(chosen.key)
+                sent_deal_keys.add(canonical_deal_key(chosen))
                 state["sent_keys"] = sorted(sent)[-500:]
                 save_state(state)
         else:
@@ -959,6 +1035,9 @@ def main(test_latest: bool = False) -> int:
 
     sf_new = [p for p in sf_current if str(p["source_id"]) not in sf_seen]
     print(f"Secret Flying neue/noch nicht gesehene Artikel: {len(sf_new)}")
+
+    aux_items = fetch_aux_sources()
+    print(f"Zusätzliche öffentliche Quellen: {len(aux_items)} Kandidaten")
 
     # ----------------------------
     # Retry pending Telegram
@@ -1016,6 +1095,19 @@ def main(test_latest: bool = False) -> int:
         if deal.score >= ALERT_THRESHOLD:
             candidates.append(deal)
 
+    # Public auxiliary sources are used only when they explicitly indicate a
+    # mistake/error fare. This adds discovery without forwarding normal deals.
+    for item in aux_items:
+        key = f"{item['source']}:{item['source_id']}"
+        if key in sent or key in pending:
+            continue
+        if article_fetches >= MAX_ARTICLE_FETCHES:
+            break
+        article_fetches += 1
+        deal = build_deal(item, source_is_error_page=False)
+        if deal.score >= ALERT_THRESHOLD and deal.explicit_error:
+            candidates.append(deal)
+
     # ----------------------------
     # Cross-source dedupe by normalized title
     # ----------------------------
@@ -1029,6 +1121,15 @@ def main(test_latest: bool = False) -> int:
             unique[dedupe_key] = deal
 
     ordered = sorted(unique.values(), key=lambda d: d.score, reverse=True)
+    filtered = []
+    seen_deal_keys = set(sent_deal_keys)
+    for deal in ordered:
+        ck = canonical_deal_key(deal)
+        if ck in seen_deal_keys:
+            continue
+        filtered.append(deal)
+        seen_deal_keys.add(ck)
+    ordered = filtered
     print(f"Relevante Kandidaten: {len(ordered)}")
 
     # ----------------------------
@@ -1054,6 +1155,10 @@ def main(test_latest: bool = False) -> int:
         if send_telegram(payload.get("message", "")):
             sent.add(key)
             pending.pop(key, None)
+            # Recover the matching deal from the current batch for cross-source dedupe.
+            match = next((d for d in ordered if d.key == key), None)
+            if match:
+                sent_deal_keys.add(canonical_deal_key(match))
 
     # Mark newly observed SF items as seen only after the source was fetched.
     sf_seen.update(str(p["source_id"]) for p in sf_current)
@@ -1061,6 +1166,7 @@ def main(test_latest: bool = False) -> int:
     # Bound state size.
     state["sf_seen"] = list(sorted(sf_seen))[-500:]
     state["sent_keys"] = list(sorted(sent))[-500:]
+    state["sent_deal_keys"] = list(sorted(sent_deal_keys))[-500:]
     state["pending"] = dict(list(pending.items())[-30:])
     save_state(state)
 
