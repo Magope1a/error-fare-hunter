@@ -1,6 +1,6 @@
 {
   "initialized": true,
-  "efa_last_seen": 602,
+  "efa_last_seen": 603,
   "sf_seen": [
     "https://www.secretflying.com/africa-flight-deals/",
     "https://www.secretflying.com/alerts/",
@@ -28,7 +28,11 @@
     "https://www.secretflying.com/south-america-flight-deals/",
     "https://www.secretflying.com/uk-ireland-flight-deals/"
   ],
-  "sent_keys": [],
+  "sent_keys": [
+    "ErrorFareAlerts:603"
+  ],
   "pending": {},
-  "sent_deal_keys": []
+  "sent_deal_keys": [
+    "flughafenzrichzrh|mombasainternationalairportmba|economy|75"
+  ]
 }
