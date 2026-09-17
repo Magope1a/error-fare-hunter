@@ -1,1182 +1,365 @@
-#!/usr/bin/env python3
-from __future__ import annotations
-
-import html as html_lib
-import json
-import os
-import re
-import sys
-import time
-import urllib.parse
-import urllib.request
-from dataclasses import dataclass
+import json, os, re, sys, time
 from pathlib import Path
-from typing import Iterable
+from datetime import date, timedelta
 
-# ============================================================
-# CONFIG
-# ============================================================
+try:
+    from swoop import deals, explore, price_explore_all, Region
+except Exception as exc:
+    print(f"IMPORT_ERROR: {exc}")
+    sys.exit(2)
 
-EFA_CHANNEL = "errorfarealerts"
-EFA_FEED_URL = f"https://t.me/s/{EFA_CHANNEL}"
-SF_ERROR_URL = "https://www.secretflying.com/error-fares/"
-SF_BASE = "https://www.secretflying.com"
-
-# Additional public sources: used for cross-source confirmation, not blind forwarding.
-F4F_MISTAKE_URL = "https://www.fly4free.com/flight-deals/mistake/"
-F4F_GLITCH_URL = "https://www.fly4free.com/flight-deals/ota-glitch/"
-TRAVEL_DEALZ_RSS = "https://travel-dealz.de/feed/"
 STATE_FILE = Path(".errorfare_hunter_state.json")
-
-MAX_EFA_PAGES = 12
-MAX_SF_PAGES = 3
-MAX_AUX_ITEMS = 30
-MAX_ARTICLE_FETCHES = 12
-REQUEST_TIMEOUT = 20
-USER_AGENT = (
-    "Mozilla/5.0 (compatible; ErrorFareHunter/Final; +https://github.com/)"
-)
-
-# Alert policy: high recall, still selective enough for Telegram.
 ALERT_THRESHOLD = 65
-URGENT_THRESHOLD = 80
+URGENT_THRESHOLD = 85
+ONE_WAY_PER_ORIGIN = 8
+ORIGIN_BATCH_SIZE = 2
 
-# ============================================================
-# KEYWORDS
-# ============================================================
+ORIGINS = ["DUS","CGN","FRA","BER","HAM","MUC","AMS","EIN","BRU","LUX"]
 
 ASIA = {
-    "japan", "tokyo", "tokio", "osaka", "kyoto", "fukuoka", "nagoya",
-    "south korea", "seoul", "busan",
-    "china", "beijing", "shanghai", "guangzhou", "shenzhen",
-    "hong kong", "taiwan", "taipei",
-    "thailand", "bangkok", "phuket", "chiang mai",
-    "vietnam", "hanoi", "ho chi minh", "saigon", "danang", "da nang",
-    "singapore", "malaysia", "kuala lumpur", "penang",
-    "indonesia", "bali", "jakarta",
-    "philippines", "manila", "cebu",
-    "india", "mumbai", "delhi", "goa",
-    "nepal", "kathmandu", "sri lanka", "colombo",
-    "cambodia", "phnom penh", "siem reap",
-    "maldives", "male", "mongolia", "ulaanbaatar",
-    "uzbekistan", "tashkent", "kazakhstan", "almaty",
-    "kyrgyzstan", "bishkek", "asia",
+    "japan","tokyo","osaka","kyoto","seoul","south korea","china","beijing","shanghai",
+    "hong kong","taiwan","taipei","thailand","bangkok","phuket","vietnam","hanoi",
+    "ho chi minh","singapore","malaysia","kuala lumpur","indonesia","bali","jakarta",
+    "philippines","manila","india","mumbai","delhi","asia"
 }
-NORTH_AMERICA = {
-    "usa", "united states", "new york", "los angeles", "chicago", "miami",
-    "boston", "san francisco", "seattle", "las vegas", "washington",
-    "canada", "toronto", "vancouver", "montreal", "mexico", "cancun",
-}
-SOUTH_AMERICA = {
-    "brazil", "sao paulo", "são paulo", "rio de janeiro", "argentina",
-    "buenos aires", "chile", "santiago", "peru", "lima", "colombia", "bogota",
-}
-OCEANIA = {
-    "australia", "sydney", "melbourne", "brisbane", "perth", "new zealand",
-    "auckland", "christchurch",
-}
-AFRICA = {
-    "south africa", "cape town", "johannesburg", "kenya", "mombasa", "nairobi",
-    "tanzania", "zanzibar", "morocco", "marrakesh", "egypt", "cairo",
-}
-MIDDLE_EAST = {
-    "uae", "dubai", "abu dhabi", "qatar", "doha", "saudi arabia", "jeddah",
-    "riyadh", "oman", "muscat", "israel", "tel aviv", "jordan", "amman",
-}
-PREFERRED = {
-    "düsseldorf", "duesseldorf", "dus", "köln", "cologne", "cgn",
-    "frankfurt", "fra", "berlin", "ber", "hamburg", "ham",
-    "münchen", "munich", "muc", "amsterdam", "ams", "eindhoven", "ein",
-    "brussels", "brüssel", "bru", "luxembourg", "lux",
-}
-SHORT_HAUL = {
-    "mallorca", "palma", "london", "paris", "rome", "madrid", "barcelona",
-    "lisbon", "vienna", "zurich", "basel", "prague", "budapest", "amsterdam",
-    "brussels", "brüssel", "berlin", "düsseldorf", "frankfurt",
-}
+AFRICA = {"zanzibar","mombasa","kenya","mauritius","seychelles","namibia","cape town",
+          "south africa","tanzania","morocco","egypt","africa"}
+LONG_HAUL = ASIA | AFRICA | {"usa","united states","canada","new york","los angeles",
+                              "miami","san francisco","boston","toronto","vancouver",
+                              "australia","sydney","melbourne","new zealand","brazil",
+                              "argentina"}
+SHORT_HAUL = {"mallorca","palma","london","paris","rome","madrid","barcelona","lisbon",
+              "vienna","zurich","basel","prague","budapest"}
 
-GENERIC_FOOTER = (
-    "error fares are price errors in travel deals",
-    "our algorithm detects error fares",
-    "notifies you immediately",
-    "sign up for free now",
-    "errorfarealerts.com",
-    "errorfarealerts",
-)
+def load_state():
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {"sent_keys": [], "seen_fingerprints": []}
 
-ERROR_SIGNALS = (
-    "error fare", "error-fare", "mistake fare", "mistake-fare",
-    "pricing mistake", "price error", "pricing error",
-    "fehlerpreis", "preisfehler", "price mistake", "fare error",
-    "fuel dump", "fuel dumping",
-)
+def save_state(state):
+    state["sent_keys"] = state.get("sent_keys", [])[-2000:]
+    state["seen_fingerprints"] = state.get("seen_fingerprints", [])[-5000:]
+    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
-GENERIC_DEAL_WORDS = (
-    "deal", "preiskracher", "kracher", "last-minute", "angebot",
-    "flugdeal", "top-deal", "mega-deal", "sale",
-)
+def env(name):
+    return os.environ.get(name, "").strip()
 
-LONG_HAUL_REGIONS = {
-    "Asien", "Nordamerika", "Südamerika", "Australien/Ozeanien", "Afrika"
-}
-
-# ============================================================
-# DATA
-# ============================================================
-
-@dataclass
-class Deal:
-    key: str
-    source: str
-    source_id: str
-    source_url: str
-    article_url: str | None
-    title: str
-    text: str
-    price: float | None
-    cabin: str
-    airline: str | None
-    origin: str | None
-    destination: str | None
-    travel_dates: str | None
-    baggage: str | None
-    stops: str | None
-    explicit_error: bool
-    region: str
-    preferred_departure: bool
-    short_haul: bool
-    score: int
-    level: str
-    reasons: list[str]
-
-# ============================================================
-# NETWORK / HTML
-# ============================================================
-
-def fetch(url: str) -> str:
+def telegram(text):
+    token, chat = env("TELEGRAM_BOT_TOKEN"), env("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        print("Telegram secrets fehlen.")
+        return False
+    import urllib.request, urllib.parse
+    data = urllib.parse.urlencode({"chat_id": chat, "text": text, "disable_web_page_preview": "true"}).encode()
     req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": USER_AGENT,
-            "Accept-Language": "de,en;q=0.8",
-        },
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data=data,
+        headers={"User-Agent":"ErrorFareHunter/4.0"}
     )
-    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as response:
-        return response.read().decode("utf-8", errors="replace")
-
-
-def clean_html(fragment: str) -> str:
-    fragment = re.sub(r"<script.*?</script>", " ", fragment, flags=re.S | re.I)
-    fragment = re.sub(r"<style.*?</style>", " ", fragment, flags=re.S | re.I)
-    fragment = re.sub(r"<br\s*/?>", "\n", fragment, flags=re.I)
-    fragment = re.sub(r"</p>|</div>|</li>|</h[1-6]>", "\n", fragment, flags=re.I)
-    fragment = re.sub(r"<[^>]+>", " ", fragment)
-    text = html_lib.unescape(fragment).replace("\xa0", " ")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n\s*\n+", "\n", text)
-    return text.strip()
-
-# ============================================================
-# PARSING
-# ============================================================
-
-def normalize_price_value(value: str) -> float | None:
     try:
-        s = value.strip().replace("\xa0", "")
-        if "," in s and "." in s:
-            s = s.replace(".", "").replace(",", ".")
-        elif "," in s:
-            s = s.replace(",", ".")
-        elif s.count(".") > 1:
-            s = s.replace(".", "")
-        return float(s)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return 200 <= r.status < 300
+    except Exception as exc:
+        print("Telegram-Fehler:", exc)
+        return False
+
+def norm(x):
+    return re.sub(r"\s+", " ", str(x or "")).strip()
+
+def text_of_deal(d):
+    vals = []
+    for attr in ["origin","destination","destination_city","price","currency","discount_pct",
+                 "departure_date","return_date","airlines","cabin","trip_length"]:
+        try:
+            vals.append(str(getattr(d, attr, "")))
+        except Exception:
+            pass
+    return " ".join(vals).lower()
+
+def destination_name(d):
+    return norm(getattr(d, "destination_city", "") or getattr(d, "destination", ""))
+
+def price_eur(d):
+    try:
+        p=float(getattr(d,"price"))
     except Exception:
         return None
-
-
-PRICE_CONTEXT = re.compile(
-    r"(?P<before>.{0,90}?(?:ab|für|fuer|from|starting|only|just| ab|round ?trip|return|hin[- ]? und[- ]? rückflug|hin[- ]?rückflug|one[- ]?way|pro person).{0,90}?)"
-    r"(?:€|EUR)\s*(?P<p1>\d{1,5}(?:[.,]\d{1,2})?)|"
-    r"(?P<before2>.{0,90}?(?:ab|für|fuer|from|starting|only|just|round ?trip|return|hin[- ]? und[- ]? rückflug|hin[- ]?rückflug|one[- ]?way|pro person).{0,90}?)"
-    r"(?P<p2>\d{1,5}(?:[.,]\d{1,2})?)\s*(?:€|EUR)",
-    re.I | re.S,
-)
-
-NEGATIVE_PRICE_CONTEXT = re.compile(
-    r"(?:gepaeck|gepäck|handgepäck|aufgabegepäck|baggage|gebühr|gebuehr|steuer|tax|sitzplatz|seat|aufpreis|extra|pro tag|per day|kind|child|kg|stück|pieces?)",
-    re.I,
-)
-
-def extract_price_candidates(text: str) -> list[tuple[float, int, str]]:
-    candidates: list[tuple[float, int, str]] = []
-    for m in PRICE_CONTEXT.finditer(text):
-        raw = m.group('p1') or m.group('p2')
-        price = normalize_price_value(raw)
-        if price is None or not 10 <= price <= 100000:
-            continue
-        context = (m.group('before') or m.group('before2') or '').strip()
-        score = 10
-        if re.search(r"(?:ab|für|fuer|from|starting|only|just)\s*$", context, re.I):
-            score += 25
-        if re.search(r"(?:round ?trip|return|hin[- ]? und[- ]? rückflug|one[- ]?way|pro person)", context, re.I):
-            score += 20
-        if NEGATIVE_PRICE_CONTEXT.search(context[-70:]):
-            score -= 40
-        candidates.append((price, score, context[-120:]))
-    return candidates
-
-
-def extract_prices(text: str) -> list[float]:
-    return sorted({p for p, score, _ in extract_price_candidates(text) if score >= 0})
-
-
-def extract_price(text: str) -> float | None:
-    candidates = extract_price_candidates(text)
-    if not candidates:
-        return None
-    # Never choose the globally smallest currency amount. Choose the strongest
-    # fare-context candidate first; use the lowest only among equally strong fare prices.
-    best_score = max(score for _, score, _ in candidates)
-    best = [price for price, score, _ in candidates if score == best_score]
-    return min(best)
-
-
-def extract_strong_prices(text: str) -> list[float]:
-    return sorted({price for price, score, _ in extract_price_candidates(text) if score >= 30})
-
-
-def price_conflict(snippet: str, article_text: str) -> tuple[float | None, str]:
-    snippet_prices = extract_strong_prices(snippet)
-    article_prices = extract_strong_prices(article_text)
-    if snippet_prices and article_prices:
-        # If both sources contain fare-context prices and disagree materially,
-        # suppress the candidate rather than trusting an accidental small number.
-        s = min(snippet_prices)
-        a = min(article_prices)
-        if max(s, a) >= 100 and abs(s - a) / max(s, a) >= 0.35:
-            return None, f"PRICE_CONFLICT {s:.0f}€ vs {a:.0f}€"
-        return s, "PRICE_CONSISTENT"
-    if snippet_prices:
-        return min(snippet_prices), "SNIPPET_PRICE"
-    if article_prices:
-        return min(article_prices), "ARTICLE_PRICE"
-    return None, "NO_STRONG_PRICE"
-
-
-def detect_cabin(text: str) -> str:
-    t = text.lower()
-    if re.search(r"\bfirst\s*-?class\b|\bfirst class\b", t):
-        return "First"
-    if re.search(r"\bbusiness\s*-?class\b|\bbusiness class\b", t):
-        return "Business"
-    if re.search(r"\bpremium\s*-?economy\b|\bpremium economy\b", t):
-        return "Premium Economy"
-    if re.search(r"\beconomy\s*-?class\b|\beconomy class\b|\beconomy\b", t):
-        return "Economy"
-    return "Unbekannt"
-
-
-def remove_generic_footer(text: str) -> str:
-    cleaned = text.lower()
-    for phrase in GENERIC_FOOTER:
-        cleaned = cleaned.replace(phrase, " ")
-    return cleaned
-
-
-def detect_explicit_error(title: str, article_text: str, source_is_error_page: bool = False) -> bool:
-    if source_is_error_page:
-        return True
-    scope = remove_generic_footer((title + "\n" + article_text[:5000]).lower())
-    return any(signal in scope for signal in ERROR_SIGNALS)
-
-
-def region_for(text: str) -> str:
-    t = text.lower()
-    if any(x in t for x in ASIA):
-        return "Asien"
-    if any(x in t for x in NORTH_AMERICA):
-        return "Nordamerika"
-    if any(x in t for x in SOUTH_AMERICA):
-        return "Südamerika"
-    if any(x in t for x in OCEANIA):
-        return "Australien/Ozeanien"
-    if any(x in t for x in AFRICA):
-        return "Afrika"
-    if any(x in t for x in MIDDLE_EAST):
-        return "Nahost"
-    return "Europa/sonstige"
-
-
-def has_any(text: str, words: Iterable[str]) -> bool:
-    t = text.lower()
-    return any(word in t for word in words)
-
-
-def first_label(text: str, labels: Iterable[str]) -> str | None:
-    for label in labels:
-        match = re.search(
-            rf"{re.escape(label)}\s*[:：]\s*([^\n]{3,160})",
-            text,
-            flags=re.I,
-        )
-        if match:
-            return re.sub(r"\s+", " ", match.group(1)).strip(" .")
-    return None
-
-
-def extract_meta_from_article(url: str | None) -> tuple[str, dict[str, str]]:
-    if not url:
-        return "", {}
-    try:
-        page = fetch(url)
-    except Exception as exc:
-        print(f"Artikelabruf fehlgeschlagen: {type(exc).__name__}")
-        return "", {}
-
-    title = ""
-    match = re.search(r"<h1[^>]*>(.*?)</h1>", page, flags=re.S | re.I)
-    if match:
-        title = clean_html(match.group(1))
-    if not title:
-        match = re.search(r"<title[^>]*>(.*?)</title>", page, flags=re.S | re.I)
-        if match:
-            title = clean_html(match.group(1))
-
-    text = clean_html(page)
-    details: dict[str, str] = {}
-
-    for field, labels in {
-        "airline": ("Airline", "Airlines"),
-        "cabin": ("Reiseklasse", "Bookingclass", "Cabin", "Cabin class"),
-        "travel_dates": ("Reisezeitraum", "Zeitraum", "Travel period", "Dates"),
-        "stops": ("Umstieg", "Stops", "Stopover"),
-    }.items():
-        value = first_label(text, labels)
-        if value:
-            details[field] = value
-
-    baggage_lines = [
-        line.strip()
-        for line in text.splitlines()
-        if re.search(r"Handgepäck|Aufgabegepäck|Gepäck|baggage", line, flags=re.I)
-    ]
-    if baggage_lines:
-        details["baggage"] = " / ".join(baggage_lines[:3])
-
-    route = re.search(
-        r"(?:von|from)\s+(.{2,120}?\(([A-Z]{3})\))\s+"
-        r"(?:nach|to)\s+(.{2,140}?\(([A-Z]{3})\))",
-        text,
-        flags=re.I,
-    )
-    if route:
-        details["origin"] = re.sub(r"\s+", " ", route.group(1)).strip()
-        details["destination"] = re.sub(r"\s+", " ", route.group(3)).strip()
-
-    if "origin" not in details:
-        origin = first_label(text, ("Abflug", "From", "Origin"))
-        if origin:
-            details["origin"] = origin
-    if "destination" not in details:
-        destination = first_label(text, ("Ziel", "To", "Destination"))
-        if destination:
-            details["destination"] = destination
-
-    return title, details
-
-# ============================================================
-# SOURCES
-# ============================================================
-
-def extract_efa_posts(page: str) -> list[dict]:
-    marks = list(re.finditer(r'data-post="' + re.escape(EFA_CHANNEL) + r'/(\d+)"', page))
-    posts: list[dict] = []
-    for i, mark in enumerate(marks):
-        chunk = page[mark.start(): marks[i + 1].start() if i + 1 < len(marks) else len(page)]
-        post_id = int(mark.group(1))
-        text_match = re.search(
-            r'<div class="tgme_widget_message_text[^>]*>(.*?)</div>',
-            chunk,
-            flags=re.S | re.I,
-        )
-        text = clean_html(text_match.group(1) if text_match else chunk)
-        urls = re.findall(r'href="(https?://[^" ]+)"', chunk, flags=re.I)
-        article_url = None
-        for raw in urls:
-            url = html_lib.unescape(raw)
-            if "errorfarealerts.com/" in url and "/newsletter/" not in url:
-                article_url = url
-                break
-        time_match = re.search(r'<time[^>]+datetime="([^"]+)"', chunk, flags=re.I)
-        posts.append({
-            "id": post_id,
-            "source_id": str(post_id),
-            "source": "ErrorFareAlerts",
-            "source_url": f"https://t.me/{EFA_CHANNEL}/{post_id}",
-            "article_url": article_url,
-            "text": text,
-            "published_at": time_match.group(1) if time_match else None,
-        })
-    posts.sort(key=lambda item: item["id"])
-    return posts
-
-
-def fetch_efa_since(last_seen: int) -> tuple[list[dict], int, bool]:
-    found: dict[int, dict] = {}
-    before: int | None = None
-    latest = last_seen
-    reached = last_seen == 0
-
-    for _ in range(MAX_EFA_PAGES):
-        url = EFA_FEED_URL if before is None else f"{EFA_FEED_URL}?before={before}"
-        page = fetch(url)
-        posts = extract_efa_posts(page)
-        if not posts:
-            break
-        for post in posts:
-            found[post["id"]] = post
-            latest = max(latest, post["id"])
-        oldest = min(post["id"] for post in posts)
-        if last_seen == 0 or oldest <= last_seen or any(post["id"] == last_seen for post in posts):
-            reached = True
-            break
-        before = oldest
-        time.sleep(0.2)
-
-    new_posts = [post for pid, post in sorted(found.items()) if pid > last_seen]
-    return new_posts, latest, reached
-
-
-def extract_sf_links(page: str) -> list[tuple[str, str]]:
-    results: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    for href, label in re.findall(r'href="([^"]+)"[^>]*>(.*?)</a>', page, flags=re.S | re.I):
-        href = html_lib.unescape(href)
-        label = clean_html(label)
-        if href.startswith("/"):
-            href = SF_BASE + href
-        if not href.startswith(SF_BASE + "/"):
-            continue
-        if any(part in href for part in ("/error-fares/", "/category/", "/wp-content/", "/tag/")):
-            continue
-        if href.rstrip("/") == SF_BASE:
-            continue
-        if href in seen:
-            continue
-        seen.add(href)
-        if label:
-            results.append((href, label))
-    return results
-
-
-def fetch_sf_recent() -> list[dict]:
-    found: dict[str, dict] = {}
-    for page_no in range(1, MAX_SF_PAGES + 1):
-        url = SF_ERROR_URL if page_no == 1 else f"{SF_ERROR_URL.rstrip('/')}/page/{page_no}/"
-        try:
-            page = fetch(url)
-        except Exception as exc:
-            print(f"Secret Flying Quelle fehlgeschlagen (Seite {page_no}): {type(exc).__name__}")
-            continue
-        for url2, label in extract_sf_links(page):
-            found[url2] = {
-                "source": "SecretFlying",
-                "source_id": url2,
-                "source_url": url2,
-                "article_url": url2,
-                "text": label,
-                "published_at": None,
-            }
-    return list(found.values())
-
-
-# ============================================================
-# AUXILIARY PUBLIC SOURCES
-# ============================================================
-
-def extract_feed_items(xml: str, source: str) -> list[dict]:
-    """Small dependency-free RSS parser for public feeds."""
-    items = []
-    for block in re.findall(r"<(?:item|entry)\b.*?</(?:item|entry)>", xml, flags=re.S | re.I):
-        def tag(name: str) -> str:
-            m = re.search(rf"<(?:[A-Za-z0-9_-]+:)?{name}[^>]*>(.*?)</(?:[A-Za-z0-9_-]+:)?{name}>", block, flags=re.S | re.I)
-            return clean_html(html_lib.unescape(m.group(1))) if m else ""
-        title = tag("title")
-        link = ""
-        m = re.search(r'<link[^>]+href=["\']([^"\']+)["\']', block, flags=re.I)
-        if m:
-            link = html_lib.unescape(m.group(1))
-        if not link:
-            link = tag("link") or tag("guid")
-        desc = tag("description") or tag("summary") or tag("content")
-        pub = tag("pubDate") or tag("published") or tag("updated")
-        if title or link:
-            sid = link or title
-            items.append({"source": source, "source_id": sid, "source_url": link or sid,
-                          "article_url": link or None, "text": f"{title}\n{desc}".strip(),
-                          "published_at": pub or None})
-    return items[:MAX_AUX_ITEMS]
-
-
-def fetch_aux_sources() -> list[dict]:
-    found: dict[str, dict] = {}
-    for url, source in ((F4F_MISTAKE_URL, "Fly4Free"), (F4F_GLITCH_URL, "Fly4Free")):
-        try:
-            page = fetch(url)
-            # Fly4free category pages are HTML, so reuse their article links.
-            for href, label in re.findall(r'href="([^"]+)"[^>]*>(.*?)</a>', page, flags=re.S | re.I):
-                href = html_lib.unescape(href)
-                label = clean_html(label)
-                if href.startswith("/"):
-                    href = "https://www.fly4free.com" + href
-                if not href.startswith("https://www.fly4free.com/") or not label:
-                    continue
-                if any(x in href for x in ("/flight-deals/mistake/", "/flight-deals/ota-glitch/", "/category/", "/tag/")):
-                    continue
-                found[href] = {"source": source, "source_id": href, "source_url": href,
-                               "article_url": href, "text": label, "published_at": None}
-        except Exception as exc:
-            print(f"{source} Quelle fehlgeschlagen: {type(exc).__name__}")
-    try:
-        xml = fetch(TRAVEL_DEALZ_RSS)
-        for item in extract_feed_items(xml, "TravelDealz"):
-            found[item["source_id"]] = item
-    except Exception as exc:
-        print(f"Travel-Dealz RSS fehlgeschlagen: {type(exc).__name__}")
-    return list(found.values())[:MAX_AUX_ITEMS]
-
-
-def canonical_deal_key(deal: Deal) -> str:
-    def norm(x: str | None) -> str:
-        return re.sub(r"[^a-z0-9]", "", (x or "").lower())
-    price = round(deal.price or 0)
-    return "|".join((norm(deal.origin), norm(deal.destination), norm(deal.cabin), str(price)))
-
-# ============================================================
-# SCORING
-# ============================================================
-
-def score_deal(title: str, text: str, price: float | None, cabin: str, explicit_error: bool) -> tuple[int, str, list[str]]:
-    full = f"{title}\n{text}".lower()
-    if "newsletter" in full:
-        return 0, "IGNORE", ["Newsletter"]
-
-    region = region_for(full)
-    asia = region == "Asien"
-    long_haul = region in LONG_HAUL_REGIONS
-    middle = region == "Nahost"
-    short = has_any(full, SHORT_HAUL) and not long_haul
-    preferred = has_any(full, PREFERRED)
-
-    score = 0
-    reasons: list[str] = []
-
-    if explicit_error:
-        score += 25
-        reasons.append("Error-Fare/Mistake-Fare-Signal")
-
-    if price is not None:
-        if cabin == "First":
-            if asia and price <= 900:
-                score += 70
-                reasons.append("First Class Asien ≤900€")
-            elif long_haul and price <= 800:
-                score += 62
-                reasons.append("First Class Langstrecke ≤800€")
-            elif price <= 600:
-                score += 40
-                reasons.append("First Class ≤600€")
-
-        elif cabin == "Business":
-            if asia:
-                if price <= 400:
-                    score += 75
-                    reasons.append("Business Asien ≤400€")
-                elif price <= 500:
-                    score += 68
-                    reasons.append("Business Asien ≤500€")
-                elif price <= 600:
-                    score += 58
-                    reasons.append("Business Asien ≤600€")
-                elif price <= 750:
-                    score += 42
-                    reasons.append("Business Asien ≤750€")
-            elif long_haul:
-                if price <= 400:
-                    score += 72
-                    reasons.append("Langstrecken-Business ≤400€")
-                elif price <= 500:
-                    score += 65
-                    reasons.append("Langstrecken-Business ≤500€")
-                elif price <= 600:
-                    score += 52
-                    reasons.append("Langstrecken-Business ≤600€")
-                elif price <= 700:
-                    score += 38
-                    reasons.append("Langstrecken-Business ≤700€")
-            elif middle:
-                if price <= 450:
-                    score += 55
-                    reasons.append("Nahost-Business ≤450€")
-                elif price <= 600:
-                    score += 38
-                    reasons.append("Nahost-Business ≤600€")
-            else:
-                if price <= 180:
-                    score += 42
-                    reasons.append("Business ≤180€")
-                elif price <= 250:
-                    score += 34
-                    reasons.append("Business ≤250€")
-                elif price <= 300:
-                    score += 22
-                    reasons.append("Business ≤300€")
-
-        elif cabin == "Premium Economy":
-            if asia and price <= 450:
-                score += 48
-                reasons.append("Premium Economy Asien ≤450€")
-            elif long_haul and price <= 400:
-                score += 38
-                reasons.append("Premium Economy Langstrecke ≤400€")
-
-        elif cabin == "Economy":
-            if asia:
-                if price <= 150:
-                    score += 75
-                    reasons.append("Economy Asien ≤150€")
-                elif price <= 200:
-                    score += 68
-                    reasons.append("Economy Asien ≤200€")
-                elif price <= 250:
-                    score += 58
-                    reasons.append("Economy Asien ≤250€")
-                elif price <= 300:
-                    score += 46
-                    reasons.append("Economy Asien ≤300€")
-                elif price <= 350:
-                    score += 32
-                    reasons.append("Economy Asien ≤350€")
-                elif price <= 400:
-                    score += 22
-                    reasons.append("Economy Asien ≤400€")
-            elif long_haul:
-                if price <= 150:
-                    score += 65
-                    reasons.append("Langstrecken-Economy ≤150€")
-                elif price <= 200:
-                    score += 58
-                    reasons.append("Langstrecken-Economy ≤200€")
-                elif price <= 250:
-                    score += 47
-                    reasons.append("Langstrecken-Economy ≤250€")
-                elif price <= 300:
-                    score += 34
-                    reasons.append("Langstrecken-Economy ≤300€")
-                elif price <= 350:
-                    score += 22
-                    reasons.append("Langstrecken-Economy ≤350€")
-            elif middle:
-                if price <= 180:
-                    score += 48
-                    reasons.append("Nahost-Economy ≤180€")
-                elif price <= 220:
-                    score += 36
-                    reasons.append("Nahost-Economy ≤220€")
-            else:
-                # Ordinary cheap European Economy is intentionally not an alert.
-                if price <= 40 and short:
-                    score += 3
-
-        else:
-            if asia:
-                if price <= 180:
-                    score += 55
-                    reasons.append("Asien ≤180€ (Klasse unbekannt)")
-                elif price <= 250:
-                    score += 45
-                    reasons.append("Asien ≤250€ (Klasse unbekannt)")
-                elif price <= 300:
-                    score += 34
-                    reasons.append("Asien ≤300€ (Klasse unbekannt)")
-            elif long_haul:
-                if price <= 180:
-                    score += 58
-                    reasons.append("Langstrecke ≤180€ (Klasse unbekannt)")
-                elif price <= 250:
-                    score += 46
-                    reasons.append("Langstrecke ≤250€ (Klasse unbekannt)")
-                elif price <= 300:
-                    score += 32
-                    reasons.append("Langstrecke ≤300€ (Klasse unbekannt)")
-
-    if asia:
-        score += 10
-        reasons.append("Asien priorisiert")
-    if preferred:
-        score += 6
-        reasons.append("bevorzugter Abflug")
-    if middle:
-        score += 3
-        reasons.append("Nahost")
-
-    # Europe short-haul suppression; do not punish extraordinary Business errors.
-    if short and cabin == "Economy" and not explicit_error:
-        score -= 25
-        reasons.append("Europa-Kurzstrecke abgewertet")
-    elif short and cabin == "Unbekannt" and not explicit_error:
-        score -= 10
-        reasons.append("Kurzstrecke abgewertet")
-
-    # Normal marketing language is never evidence of an error.
-    if any(word in title.lower() for word in GENERIC_DEAL_WORDS) and not explicit_error:
-        score -= 2
-
-    score = max(0, min(100, int(score)))
-    if score >= URGENT_THRESHOLD:
-        level = "🚨 SOFORT-ALARM"
-    elif score >= ALERT_THRESHOLD:
-        level = "🔥 ERROR-FARE-KANDIDAT"
-    elif score >= 45:
-        level = "🟡 BEOBACHTEN"
+    cur=str(getattr(d,"currency","EUR") or "EUR").upper()
+    # Swoop normally returns the Google Flights currency for the search locale.
+    # Treat non-EUR as approximate only for scoring; alert text preserves currency.
+    if cur in ("EUR","€"): return p
+    if cur == "USD": return p * 0.86
+    if cur == "GBP": return p * 1.15
+    return p
+
+def region_for(d):
+    t=text_of_deal(d)
+    if any(k in t for k in ASIA): return "Asien"
+    if any(k in t for k in AFRICA): return "Afrika"
+    if any(k in t for k in {"usa","canada","new york","los angeles","miami","toronto","vancouver","australia","sydney","brazil","argentina"}): return "Langstrecke"
+    if any(k in t for k in SHORT_HAUL): return "Europa"
+    return "Sonstige"
+
+def cabin_guess(d):
+    t=text_of_deal(d)
+    if "first" in t: return "First"
+    if "business" in t: return "Business"
+    if "premium economy" in t or "premium-economy" in t: return "Premium Economy"
+    return "Economy"
+
+def score(d):
+    p=price_eur(d)
+    if p is None: return 0, []
+    t=text_of_deal(d)
+    region=region_for(d)
+    cabin=cabin_guess(d)
+    reasons=[]
+    s=0
+
+    # Strong price bands for the user's target.
+    if region=="Asien":
+        if cabin=="Business" and p <= 500: s+=70; reasons.append("Asien-Business ≤500€")
+        elif cabin=="First" and p <= 900: s+=80; reasons.append("Asien-First ≤900€")
+        elif cabin=="Premium Economy" and p <= 300: s+=65; reasons.append("Asien-Premium-Economy ≤300€")
+        elif p <= 250: s+=60; reasons.append("Asien-Economy ≤250€")
+        elif p <= 350: s+=45; reasons.append("Asien-Economy ≤350€")
+        elif p <= 450: s+=30; reasons.append("Asien-Economy ≤450€")
+    elif region=="Afrika":
+        if cabin=="Business" and p <= 550: s+=70; reasons.append("Afrika-Business ≤550€")
+        elif cabin=="Premium Economy" and p <= 250: s+=65; reasons.append("Afrika-Premium-Economy ≤250€")
+        elif p <= 120: s+=60; reasons.append("Afrika-Economy ≤120€")
+        elif p <= 180: s+=45; reasons.append("Afrika-Economy ≤180€")
+    elif region=="Langstrecke":
+        if cabin=="Business" and p <= 500: s+=65; reasons.append("Langstrecken-Business ≤500€")
+        elif p <= 220: s+=55; reasons.append("Langstrecken-Economy ≤220€")
+        elif p <= 300: s+=40; reasons.append("Langstrecken-Economy ≤300€")
     else:
-        level = "❌ IGNORIEREN"
-    return score, level, reasons
+        if p <= 70: s+=15; reasons.append("Europa ≤70€")
+        elif p <= 100: s+=8; reasons.append("Europa ≤100€")
 
-# ============================================================
-# BUILD / FORMAT
-# ============================================================
+    origin=str(getattr(d,"origin","") or "").upper()
+    if origin in ORIGINS:
+        s+=10; reasons.append("bevorzugter Abflug")
 
-def build_deal(item: dict, source_is_error_page: bool = False) -> Deal:
-    article_title, details = extract_meta_from_article(item.get("article_url")) if item.get("article_url") else ("", {})
-    effective_title = article_title or item.get("text", "").split("\n", 1)[0].strip()
-    merged = "\n".join([
-        effective_title,
-        item.get("text", ""),
-        details.get("origin", ""),
-        details.get("destination", ""),
-        details.get("airline", ""),
-        details.get("travel_dates", ""),
-        details.get("cabin", ""),
-        details.get("baggage", ""),
-        details.get("stops", ""),
-    ])
-
-    # Price must come from an actual fare phrase, not from arbitrary numbers
-    # anywhere in baggage/metadata/HTML. Compare source snippet and article.
-    price, price_status = price_conflict(item.get("text", ""), article_title + "\n" + merged)
-    if price is None and item.get("article_url"):
-        # Last fallback: title only, still using contextual price parsing.
-        price = extract_price(effective_title)
-        if price is not None:
-            price_status = "TITLE_PRICE"
-    cabin = details.get("cabin") or detect_cabin(merged)
-    cabin_lower = cabin.lower()
-    if cabin_lower.startswith("business"):
-        cabin = "Business"
-    elif cabin_lower.startswith("economy"):
-        cabin = "Economy"
-    elif cabin_lower.startswith("premium"):
-        cabin = "Premium Economy"
-    elif cabin_lower.startswith("first"):
-        cabin = "First"
-    else:
-        cabin = detect_cabin(merged)
-
-    explicit_error = detect_explicit_error(
-        effective_title,
-        item.get("text", "") + "\n" + article_title,
-        source_is_error_page=source_is_error_page,
-    )
-    if item.get("source") == "Fly4Free" and re.search(r"error\s*fare|mistake|glitch", merged, re.I):
-        explicit_error = True
-    region = region_for(merged)
-    preferred = has_any(merged, PREFERRED)
-    short = has_any(merged, SHORT_HAUL) and region not in LONG_HAUL_REGIONS
-
-    score, level, reasons = score_deal(
-        effective_title,
-        merged,
-        price,
-        cabin,
-        explicit_error,
-    )
-
-    if price_status == "PRICE_CONFLICT":
-        score = 0
-        level = "❌ IGNORIEREN"
-        reasons.insert(0, "Preis-Konflikt zwischen Quelle und Artikel – kein Alarm")
-    elif price_status in {"SNIPPET_PRICE", "ARTICLE_PRICE", "TITLE_PRICE"}:
-        reasons.insert(0, f"Preisprüfung: {price_status}")
-
-    if details.get("origin") and details.get("destination"):
-        reasons.append(f"{details['origin']} → {details['destination']}")
-
-    key = f"{item['source']}:{item['source_id']}"
-    return Deal(
-        key=key,
-        source=item["source"],
-        source_id=item["source_id"],
-        source_url=item["source_url"],
-        article_url=item.get("article_url"),
-        title=effective_title,
-        text=item.get("text", ""),
-        price=price,
-        cabin=cabin,
-        airline=details.get("airline"),
-        origin=details.get("origin"),
-        destination=details.get("destination"),
-        travel_dates=details.get("travel_dates"),
-        baggage=details.get("baggage"),
-        stops=details.get("stops"),
-        explicit_error=explicit_error,
-        region=region,
-        preferred_departure=preferred,
-        short_haul=short,
-        score=score,
-        level=level,
-        reasons=reasons[:10],
-    )
-
-
-def format_alert(deal: Deal) -> str:
-    price = f"{deal.price:.0f} €" if deal.price is not None else "Preis nicht erkannt"
-    lines = [
-        f"{deal.level}",
-        "",
-        f"💰 Preis: {price}",
-        f"💺 Klasse: {deal.cabin}",
-        f"📊 Score: {deal.score}/100",
-        f"🌍 Region: {deal.region}",
-    ]
-    if deal.origin or deal.destination:
-        lines.append(f"✈️ Route: {deal.origin or '?'} → {deal.destination or '?'}")
-    if deal.airline:
-        lines.append(f"🏷️ Airline: {deal.airline}")
-    if deal.travel_dates:
-        lines.append(f"📅 Termine: {deal.travel_dates}")
-    if deal.stops:
-        lines.append(f"🔄 Umstieg: {deal.stops}")
-    if deal.baggage:
-        lines.append(f"🧳 Gepäck: {deal.baggage}")
-    lines.append("")
-    lines.append("🔎 Warum:")
-    lines.extend(f"• {reason}" for reason in deal.reasons[:8])
-    lines.append("")
-    lines.append("⚠️ Preis sofort beim Anbieter prüfen – Error Fares können sehr schnell verschwinden.")
-    if deal.article_url:
-        lines.append(f"🔗 Deal: {deal.article_url}")
-    lines.append(f"🔗 Quelle: {deal.source_url}")
-    return "\n".join(lines)[:3900]
-
-# ============================================================
-# STATE
-# ============================================================
-
-def load_state() -> dict:
-    if not STATE_FILE.exists():
-        return {
-            "initialized": False,
-            "efa_last_seen": 0,
-            "sf_seen": [],
-            "sent_keys": [],
-            "pending": {},
-            "sent_deal_keys": [],
-        }
     try:
-        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        if not isinstance(state, dict):
-            raise ValueError("Ungültiger State")
-        state.setdefault("initialized", False)
-        state.setdefault("efa_last_seen", 0)
-        state.setdefault("sf_seen", [])
-        state.setdefault("sent_keys", [])
-        state.setdefault("pending", {})
-        return state
+        disc=float(getattr(d,"discount_pct"))
+        if disc >= 60: s+=15; reasons.append(f"{disc:.0f}% unter Google-Referenz")
+        elif disc >= 45: s+=10; reasons.append(f"{disc:.0f}% unter Google-Referenz")
     except Exception:
-        return {
-            "initialized": False,
-            "efa_last_seen": 0,
-            "sf_seen": [],
-            "sent_keys": [],
-            "pending": {},
-            "sent_deal_keys": [],
-        }
+        pass
 
+    # Prevent ordinary European bargains from becoming alerts.
+    if region=="Europa" and s < 70:
+        s=0
+        reasons=[]
 
-def save_state(state: dict) -> None:
-    STATE_FILE.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    return min(100,s), reasons
+
+def fingerprint(d):
+    try:
+        return str(getattr(d,"fingerprint"))
+    except Exception:
+        return "|".join([
+            str(getattr(d,"origin","")), str(getattr(d,"destination","")),
+            str(getattr(d,"departure_date","")), str(getattr(d,"return_date","")),
+            str(getattr(d,"price",""))
+        ])
+
+def deal_link(d):
+    # Google Flights search is reconstructed from route/date where possible.
+    origin=str(getattr(d,"origin","") or "")
+    dest=str(getattr(d,"destination","") or "")
+    dep=str(getattr(d,"departure_date","") or "")
+    ret=str(getattr(d,"return_date","") or "")
+    if origin and dest and dep:
+        url=f"https://www.google.com/travel/flights?q=Flights%20from%20{origin}%20to%20{dest}%20on%20{dep}"
+        if ret: url += f"%20returning%20{ret}"
+        return url
+    return "https://www.google.com/travel/flights"
+
+def format_alarm(d, sc, reasons):
+    p=getattr(d,"price",None)
+    cur=str(getattr(d,"currency","EUR") or "EUR")
+    origin=norm(getattr(d,"origin",""))
+    dest=norm(getattr(d,"destination_city","") or getattr(d,"destination",""))
+    cabin=cabin_guess(d)
+    region=region_for(d)
+    disc=getattr(d,"discount_pct","")
+    dep=getattr(d,"departure_date","")
+    ret=getattr(d,"return_date","")
+    dates=f"{dep}" + (f" → {ret}" if ret else "")
+    urgent="🚨 SOFORT-ALARM" if sc>=URGENT_THRESHOLD else "🔥 ERROR-FARE-KANDIDAT"
+    why="\n".join(f"• {x}" for x in reasons) or "• ungewöhnlich günstiger Google-Flights-Treffer"
+    return (
+        f"{urgent}\n\n"
+        f"💰 Preis: {p} {cur}\n"
+        f"💺 Klasse: {cabin}\n"
+        f"📊 Score: {sc}/100\n"
+        f"🌍 Region: {region}\n"
+        f"✈️ Route: {origin} → {dest}\n"
+        f"📅 Datum: {dates}\n"
+        + (f"📉 Google-Referenzrabatt: {float(disc):.0f}%\n" if disc != "" else "")
+        + "\n🔎 Warum:\n" + why +
+        "\n\n⚠️ Preis direkt bei der Buchung prüfen – Google-Flights-Preise können sich sehr schnell ändern.\n"
+        f"🔗 Suche: {deal_link(d)}"
     )
 
-# ============================================================
-# TELEGRAM
-# ============================================================
 
-def send_telegram(message: str) -> bool:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-    if not token or not chat_id:
-        print("Telegram-Secrets fehlen.")
-        return False
+def one_way_region_for_destination(region_name: str):
+    return {
+        "Asien": Region.ASIA_PACIFIC,
+        "Afrika": Region.AFRICA,
+        "Langstrecke": Region.NORTH_AMERICA,
+    }.get(region_name)
 
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    data = urllib.parse.urlencode({
-        "chat_id": chat_id,
-        "text": message,
-        "disable_web_page_preview": "false",
-    }).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method="POST")
 
+def one_way_score(price: float | None, region: str, cabin: str, origin: str, destination: str):
+    if price is None:
+        return 0, []
+    reasons = []
+    s = 0
+    if region == "Asien":
+        if cabin == "Business" and price <= 550: s += 75; reasons.append("One-Way Asien-Business ≤550€")
+        elif cabin == "First" and price <= 950: s += 85; reasons.append("One-Way Asien-First ≤950€")
+        elif cabin == "Premium Economy" and price <= 300: s += 70; reasons.append("One-Way Asien-Premium-Economy ≤300€")
+        elif price <= 180: s += 75; reasons.append("One-Way Asien-Economy ≤180€")
+        elif price <= 230: s += 60; reasons.append("One-Way Asien-Economy ≤230€")
+        elif price <= 300: s += 45; reasons.append("One-Way Asien-Economy ≤300€")
+    elif region == "Afrika":
+        if cabin == "Business" and price <= 600: s += 75; reasons.append("One-Way Afrika-Business ≤600€")
+        elif cabin == "Premium Economy" and price <= 280: s += 70; reasons.append("One-Way Afrika-Premium-Economy ≤280€")
+        elif price <= 90: s += 80; reasons.append("One-Way Afrika-Economy ≤90€")
+        elif price <= 140: s += 65; reasons.append("One-Way Afrika-Economy ≤140€")
+        elif price <= 190: s += 50; reasons.append("One-Way Afrika-Economy ≤190€")
+    else:
+        if cabin == "Business" and price <= 550: s += 70; reasons.append("One-Way Langstrecken-Business ≤550€")
+        elif price <= 220: s += 65; reasons.append("One-Way Langstrecken-Economy ≤220€")
+        elif price <= 300: s += 45; reasons.append("One-Way Langstrecken-Economy ≤300€")
+    if origin in ORIGINS:
+        s += 10; reasons.append("bevorzugter Abflug")
+    return min(100, s), reasons
+
+
+def add_one_way_deals(origin: str, region_name: str, state: dict, out: list):
+    region = one_way_region_for_destination(region_name)
+    if region is None:
+        return
     try:
-        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as response:
-            result = json.loads(response.read().decode("utf-8"))
-        if result.get("ok"):
-            print("Telegram: erfolgreich gesendet.")
-            return True
-        print("Telegram API Fehler:", result)
-        return False
+        exp = explore(origin, region=region, one_way=True)
+        dests = list(getattr(exp, "destinations", []) or [])[:ONE_WAY_PER_ORIGIN]
+        if not dests:
+            print(f"{origin} {region_name}: keine One-Way-Ziele")
+            return
+        prices = price_explore_all(dests)
+        for d, pr in zip(dests, prices):
+            if pr is None:
+                continue
+            price = float(getattr(pr, "price", 0) or 0)
+            currency = str(getattr(pr, "currency", "EUR") or "EUR").upper()
+            if currency == "USD": price_eur_value = price * 0.86
+            elif currency == "GBP": price_eur_value = price * 1.15
+            else: price_eur_value = price
+            destination = norm(getattr(d, "destination_name", "") or getattr(d, "destination", ""))
+            cabin = "Economy"
+            sc, reasons = one_way_score(price_eur_value, region_name, cabin, origin, destination)
+            if sc >= ALERT_THRESHOLD:
+                fp = f"OW|{origin}|{getattr(d,'destination','')}|{getattr(d,'departure_date','')}|{round(price,0)}"
+                out.append((sc, {
+                    "kind":"one-way", "fingerprint":fp, "origin":origin,
+                    "destination":destination, "price":price, "currency":currency,
+                    "region":region_name, "cabin":cabin, "departure_date":getattr(d,'departure_date',''),
+                    "return_date":"", "reasons":reasons,
+                }))
+        print(f"{origin} {region_name}: {len(dests)} One-Way-Ziele geprüft")
     except Exception as exc:
-        print("Telegram-Verbindungsfehler:", type(exc).__name__)
-        return False
+        print(f"{origin} {region_name}: One-Way FEHLER {type(exc).__name__}: {exc}")
 
-# ============================================================
-# MAIN
-# ============================================================
 
-def main(test_latest: bool = False) -> int:
+def format_one_way_alarm(d: dict, sc: int):
+    urgent = "🚨 SOFORT-ALARM" if sc >= URGENT_THRESHOLD else "🔥 ERROR-FARE-KANDIDAT"
+    why = "\n".join(f"• {x}" for x in d["reasons"])
+    date_text = d["departure_date"] or "Google-Vorschlag"
+    url = f"https://www.google.com/travel/flights?q=Flights%20from%20{d['origin']}%20to%20{d['destination']}%20on%20{date_text}"
+    return (f"{urgent}\n\n💰 Preis: {d['price']} {d['currency']}\n💺 Klasse: {d['cabin']}\n"
+            f"📊 Score: {sc}/100\n🌍 Region: {d['region']}\n✈️ Route: {d['origin']} → {d['destination']}\n"
+            f"📅 Datum: {date_text}\n🔎 Warum:\n{why}\n\n"
+            f"⚠️ One-Way-Fund aus unabhängiger Google-Flights-Suche. Preis sofort prüfen.\n🔗 Suche: {url}")
+
+def main():
     state = load_state()
-    sent = set(str(x) for x in state.get("sent_keys", []))
-    pending = state.get("pending", {}) or {}
-    sent_deal_keys = set(str(x) for x in state.get("sent_deal_keys", []))
+    sent = set(state.get("sent_keys", []))
+    seen = set(state.get("seen_fingerprints", []))
+    all_deals = []
+    one_way = []
+    errors = 0
 
-    print("=== ERROR FARE HUNTER V3 ===")
-    print(f"Alert-Schwelle: {ALERT_THRESHOLD}")
-    print(f"Sofort-Alarm: {URGENT_THRESHOLD}")
+    print("=== ERROR FARE HUNTER V4 INDEPENDENT+ ===")
+    print("Roundtrip: direkte Google-Flights-Deals | One-Way: gestaffelte Explore-Suche")
 
-    # ----------------------------
-    # Initial baseline
-    # ----------------------------
-    if not state.get("initialized", False):
+    # Roundtrip: every run, all preferred origins. This is the fast broad scan.
+    for origin in ORIGINS:
         try:
-            efa_now = extract_efa_posts(fetch(EFA_FEED_URL))
-            state["efa_last_seen"] = max((p["id"] for p in efa_now), default=0)
+            result = deals(origin, max_price=1200, min_discount_pct=35)
+            ds = list(getattr(result, "deals", []) or [])
+            print(f"{origin}: {len(ds)} Roundtrip-Kandidaten")
+            all_deals.extend(ds)
         except Exception as exc:
-            print("ErrorFareAlerts Initialisierung fehlgeschlagen:", type(exc).__name__)
-            return 1
+            errors += 1
+            print(f"{origin}: ROUNDTRIP FEHLER {type(exc).__name__}: {exc}")
+        time.sleep(0.35)
 
-        try:
-            sf_now = fetch_sf_recent()
-            state["sf_seen"] = [p["source_id"] for p in sf_now][-300:]
-        except Exception as exc:
-            print("Secret Flying Initialisierung fehlgeschlagen:", type(exc).__name__)
-            state["sf_seen"] = []
+    candidates = []
+    for d in all_deals:
+        fp = fingerprint(d)
+        if fp in seen:
+            continue
+        seen.add(fp)
+        sc, reasons = score(d)
+        if sc >= ALERT_THRESHOLD:
+            candidates.append((sc, d, reasons, "roundtrip"))
 
-        state["initialized"] = True
-        state["sent_keys"] = []
-        state["pending"] = {}
-        state.setdefault("sent_deal_keys", [])
-        save_state(state)
+    # One-way: staggered to avoid hammering Google. Two origins per run, one region;
+    # state rotates through all origin/region combinations over subsequent runs.
+    regions = ["Asien", "Afrika", "Langstrecke"]
+    cursor = int(state.get("one_way_cursor", 0))
+    jobs = [(o, r) for o in ORIGINS for r in regions]
+    selected = [jobs[(cursor + i) % len(jobs)] for i in range(ORIGIN_BATCH_SIZE)]
+    state["one_way_cursor"] = (cursor + ORIGIN_BATCH_SIZE) % len(jobs)
+    for origin, region_name in selected:
+        add_one_way_deals(origin, region_name, state, one_way)
 
-        print(f"Erstinitialisierung: EFA-Basis {state['efa_last_seen']}, SF-Basis {len(state['sf_seen'])} Artikel")
+    for sc, d in one_way:
+        if d["fingerprint"] not in seen:
+            seen.add(d["fingerprint"])
+            candidates.append((sc, d, d["reasons"], "one-way"))
 
-        if not test_latest:
-            print("Baseline gesetzt – noch kein historischer Alarm.")
-            return 0
-
-        # Manual smoke test: evaluate current feeds, send max one.
-        candidates: list[Deal] = []
-        for item in efa_now[-20:]:
-            if item.get("article_url"):
-                candidates.append(build_deal(item, source_is_error_page=False))
-        for item in sf_now[-20:]:
-            candidates.append(build_deal(item, source_is_error_page=True))
-        candidates = [d for d in candidates if d.score >= ALERT_THRESHOLD]
-        if candidates:
-            candidates.sort(key=lambda d: d.score, reverse=True)
-            chosen = candidates[0]
-            print(f"TESTALARM: {chosen.key} {chosen.score}/100")
-            if send_telegram(format_alert(chosen)):
-                sent.add(chosen.key)
-                sent_deal_keys.add(canonical_deal_key(chosen))
-                state["sent_keys"] = sorted(sent)[-500:]
-                save_state(state)
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    sent_now = 0
+    for sc, d, reasons, kind in candidates[:3]:
+        if kind == "one-way":
+            key = d["fingerprint"]
+            text = format_one_way_alarm(d, sc)
         else:
-            print("TESTALARM: Kein Kandidat über Schwelle.")
-        return 0
-
-    # ----------------------------
-    # New ErrorFareAlerts posts
-    # ----------------------------
-    last_efa = int(state.get("efa_last_seen", 0))
-    try:
-        efa_posts, latest_efa, reached = fetch_efa_since(last_efa)
-    except Exception as exc:
-        print("ErrorFareAlerts Abruf fehlgeschlagen:", type(exc).__name__)
-        efa_posts, latest_efa, reached = [], last_efa, False
-
-    print(f"EFA letzte ID: {last_efa}")
-    print(f"EFA neue Beiträge: {len(efa_posts)}")
-    if not reached:
-        print("WARNUNG: EFA-Pagination hat die letzte bekannte ID nicht erreicht.")
-    else:
-        state["efa_last_seen"] = max(last_efa, latest_efa)
-
-    # ----------------------------
-    # Secret Flying current error-fare listings
-    # ----------------------------
-    sf_seen = set(str(x) for x in state.get("sf_seen", []))
-    try:
-        sf_current = fetch_sf_recent()
-    except Exception as exc:
-        print("Secret Flying Abruf fehlgeschlagen:", type(exc).__name__)
-        sf_current = []
-
-    sf_new = [p for p in sf_current if str(p["source_id"]) not in sf_seen]
-    print(f"Secret Flying neue/noch nicht gesehene Artikel: {len(sf_new)}")
-
-    aux_items = fetch_aux_sources()
-    print(f"Zusätzliche öffentliche Quellen: {len(aux_items)} Kandidaten")
-
-    # ----------------------------
-    # Retry pending Telegram
-    # ----------------------------
-    if pending:
-        print(f"Ausstehende Telegram-Meldungen: {len(pending)}")
-        for key, payload in list(pending.items())[:5]:
-            msg = payload.get("message") if isinstance(payload, dict) else None
-            if msg and send_telegram(msg):
-                sent.add(key)
-                pending.pop(key, None)
-
-    # ----------------------------
-    # Build candidates
-    # ----------------------------
-    candidates: list[Deal] = []
-    article_fetches = 0
-
-    for item in efa_posts:
-        key = f"{item['source']}:{item['source_id']}"
-        if key in sent or key in pending:
-            continue
-
-        quick_text = item.get("text", "")
-        quick_price = extract_price(quick_text)
-        quick_cabin = detect_cabin(quick_text)
-        quick_region = region_for(quick_text)
-        plausible = (
-            quick_cabin in {"Business", "First"}
-            or quick_region in LONG_HAUL_REGIONS
-            or (quick_price is not None and quick_price <= 350)
-        )
-
-        if not plausible:
-            continue
-        if not item.get("article_url"):
-            deal = build_deal(item)
-        elif article_fetches < MAX_ARTICLE_FETCHES:
-            article_fetches += 1
-            deal = build_deal(item)
-        else:
-            deal = build_deal({**item, "article_url": None})
-
-        if deal.score >= ALERT_THRESHOLD:
-            candidates.append(deal)
-
-    for item in sf_new:
-        key = f"{item['source']}:{item['source_id']}"
-        if key in sent or key in pending:
-            continue
-        if article_fetches >= MAX_ARTICLE_FETCHES:
-            break
-        article_fetches += 1
-        deal = build_deal(item, source_is_error_page=True)
-        if deal.score >= ALERT_THRESHOLD:
-            candidates.append(deal)
-
-    # Public auxiliary sources are used only when they explicitly indicate a
-    # mistake/error fare. This adds discovery without forwarding normal deals.
-    for item in aux_items:
-        key = f"{item['source']}:{item['source_id']}"
-        if key in sent or key in pending:
-            continue
-        if article_fetches >= MAX_ARTICLE_FETCHES:
-            break
-        article_fetches += 1
-        deal = build_deal(item, source_is_error_page=False)
-        if deal.score >= ALERT_THRESHOLD and deal.explicit_error:
-            candidates.append(deal)
-
-    # ----------------------------
-    # Cross-source dedupe by normalized title
-    # ----------------------------
-    unique: dict[str, Deal] = {}
-    for deal in candidates:
-        norm = re.sub(r"[^a-z0-9]+", " ", deal.title.lower()).strip()
-        norm = re.sub(r"\b(error|fare|deal|flugdeal|from|ab|only|roundtrip|return)\b", " ", norm)
-        norm = re.sub(r"\s+", " ", norm).strip()
-        dedupe_key = norm[:180] or deal.key
-        if dedupe_key not in unique or deal.score > unique[dedupe_key].score:
-            unique[dedupe_key] = deal
-
-    ordered = sorted(unique.values(), key=lambda d: d.score, reverse=True)
-    filtered = []
-    seen_deal_keys = set(sent_deal_keys)
-    for deal in ordered:
-        ck = canonical_deal_key(deal)
-        if ck in seen_deal_keys:
-            continue
-        filtered.append(deal)
-        seen_deal_keys.add(ck)
-    ordered = filtered
-    print(f"Relevante Kandidaten: {len(ordered)}")
-
-    # ----------------------------
-    # Queue and send
-    # ----------------------------
-    for deal in ordered[:8]:
-        if deal.key in sent or deal.key in pending:
-            continue
-        pending[deal.key] = {
-            "message": format_alert(deal),
-            "score": deal.score,
-            "created_at": int(time.time()),
-        }
-
-    for key, payload in sorted(
-        pending.items(),
-        key=lambda item: int(item[1].get("score", 0)),
-        reverse=True,
-    )[:8]:
+            key = f"{fingerprint(d)}|{round(float(getattr(d,'price',0) or 0),0)}"
+            text = format_alarm(d, sc, reasons)
         if key in sent:
-            pending.pop(key, None)
             continue
-        if send_telegram(payload.get("message", "")):
+        if telegram(text):
             sent.add(key)
-            pending.pop(key, None)
-            # Recover the matching deal from the current batch for cross-source dedupe.
-            match = next((d for d in ordered if d.key == key), None)
-            if match:
-                sent_deal_keys.add(canonical_deal_key(match))
+            sent_now += 1
 
-    # Mark newly observed SF items as seen only after the source was fetched.
-    sf_seen.update(str(p["source_id"]) for p in sf_current)
-
-    # Bound state size.
-    state["sf_seen"] = list(sorted(sf_seen))[-500:]
-    state["sent_keys"] = list(sorted(sent))[-500:]
-    state["sent_deal_keys"] = list(sorted(sent_deal_keys))[-500:]
-    state["pending"] = dict(list(pending.items())[-30:])
+    state["sent_keys"] = list(sent)[-3000:]
+    state["seen_fingerprints"] = list(seen)[-8000:]
     save_state(state)
 
-    print(f"Neue Telegram-Meldungen: {len(sent) - len(set(str(x) for x in state.get('sent_keys', []))) if False else 'siehe Telegram-Logs'}")
-    print(f"Gespeicherte Meldungen: {len(state['sent_keys'])}")
-    print(f"Ausstehende Meldungen: {len(state['pending'])}")
+    print(f"Roundtrip-Preis-Kandidaten: {len(all_deals)}")
+    print(f"One-Way-Kandidaten geprüft: {len(one_way)}")
+    print(f"Neue starke Kandidaten: {len(candidates)}")
+    print(f"Neue Telegram-Alarme: {sent_now}")
+    print(f"API/Quelle-Fehler: {errors}")
     print("SCAN ABGESCHLOSSEN")
-    return 0
 
 
 if __name__ == "__main__":
-    test_latest = os.environ.get("TEST_LATEST", "0") == "1"
-    raise SystemExit(main(test_latest=test_latest))
+    main()
