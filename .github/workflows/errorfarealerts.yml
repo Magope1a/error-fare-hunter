@@ -4,13 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       test_latest:
-        description: "Live-Preissuche einmal manuell starten"
+        description: "Direkten Testlauf starten"
         required: false
         default: "0"
         type: choice
-        options:
-          - "0"
-          - "1"
+        options: ["0", "1"]
   schedule:
     - cron: "2-59/5 * * * *"
 
@@ -24,28 +22,24 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 6
     steps:
       - name: Repository laden
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
-
-      - name: Python einrichten
+      - name: Python vorbereiten
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-
-      - name: Live-Flugsuche installieren
-        run: pip install --disable-pip-version-check "swoop-flights[validation]==0.7.0"
-
+          python-version: "3.12"
+      - name: Abhängigkeiten installieren
+        run: pip install --disable-pip-version-check "swoop-flights==0.7.0"
       - name: Scanner starten
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TEST_LATEST: ${{ inputs.test_latest || '0' }}
         run: python scanner.py
-
       - name: Scanner-Status speichern
         run: |
           git config user.name "Error Fare Hunter Bot"
@@ -55,6 +49,6 @@ jobs:
             echo "Kein State-Update nötig."
             exit 0
           fi
-          git commit -m "Update independent flight scanner state"
+          git commit -m "Update Error Fare Hunter state"
           git pull --rebase origin main
           git push origin HEAD:main
