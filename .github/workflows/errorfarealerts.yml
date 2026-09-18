@@ -37,7 +37,7 @@ jobs:
           python-version: "3.11"
 
       - name: Live-Flugsuche installieren
-        run: pip install --disable-pip-version-check "swoop-flights==0.7.0"
+        run: pip install --disable-pip-version-check "swoop-flights[validation]==0.7.0"
 
       - name: Scanner starten
         env:
