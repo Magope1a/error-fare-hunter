@@ -12,7 +12,7 @@ STATE_FILE = Path(".errorfare_hunter_state.json")
 ALERT_THRESHOLD = 65
 URGENT_THRESHOLD = 85
 ONE_WAY_PER_ORIGIN = 8
-ORIGIN_BATCH_SIZE = 2
+ONE_WAY_JOB_BATCH = 4
 
 ORIGINS = ["DUS","CGN","FRA","BER","HAM","MUC","AMS","EIN","BRU","LUX"]
 
@@ -206,14 +206,6 @@ def format_alarm(d, sc, reasons):
     )
 
 
-def one_way_region_for_destination(region_name: str):
-    return {
-        "Asien": Region.ASIA_PACIFIC,
-        "Afrika": Region.AFRICA,
-        "Langstrecke": Region.NORTH_AMERICA,
-    }.get(region_name)
-
-
 def one_way_score(price: float | None, region: str, cabin: str, origin: str, destination: str):
     if price is None:
         return 0, []
@@ -241,18 +233,53 @@ def one_way_score(price: float | None, region: str, cabin: str, origin: str, des
     return min(100, s), reasons
 
 
-def add_one_way_deals(origin: str, region_name: str, state: dict, out: list):
-    region = one_way_region_for_destination(region_name)
-    if region is None:
-        return
+def one_way_region_from_text(destination: str, country: str = ""):
+    t = f"{destination} {country}".lower()
+    if any(k in t for k in ASIA):
+        return "Asien"
+    if any(k in t for k in AFRICA):
+        return "Afrika"
+    if any(k in t for k in {"usa","united states","canada","new york","los angeles","miami","toronto","vancouver","australia","sydney","melbourne","new zealand","brazil","argentina","south africa"}):
+        return "Langstrecke"
+    return "Sonstige"
+
+
+ONE_WAY_CABINS = ["economy", "premium-economy", "business", "first"]
+
+def one_way_cabin_label(cabin: str):
+    return {
+        "economy": "Economy",
+        "premium-economy": "Premium Economy",
+        "business": "Business",
+        "first": "First",
+    }.get(cabin, "Economy")
+
+
+def add_one_way_deals(origin: str, cabin: str, out: list):
+    label = one_way_cabin_label(cabin)
     try:
-        exp = explore(origin, region=region, one_way=True)
-        dests = list(getattr(exp, "destinations", []) or [])[:ONE_WAY_PER_ORIGIN]
-        if not dests:
-            print(f"{origin} {region_name}: keine One-Way-Ziele")
+        # Do NOT use swoop's region filter here. Region classification depends on
+        # airportsdata; we classify the returned destinations ourselves so a missing
+        # optional package can never silently turn the whole scan into zero results.
+        exp = explore(origin, cabin=cabin, one_way=True)
+        raw = list(getattr(exp, "destinations", []) or [])
+        ranked = []
+        for d in raw:
+            destination = norm(getattr(d, "destination_name", "") or getattr(d, "destination", ""))
+            country = norm(getattr(d, "destination_country", ""))
+            region = one_way_region_from_text(destination, country)
+            if region in {"Asien", "Afrika", "Langstrecke"}:
+                ranked.append((0 if region in {"Asien", "Afrika"} else 1, d, region))
+        ranked.sort(key=lambda x: x[0])
+        chosen = [x[1:] for x in ranked[:ONE_WAY_PER_ORIGIN]]
+        if not chosen:
+            print(f"{origin} {label}: keine relevanten One-Way-Ziele aus Explore")
             return
+
+        dests = [x[0] for x in chosen]
+        regions = [x[1] for x in chosen]
         prices = price_explore_all(dests)
-        for d, pr in zip(dests, prices):
+        for d, region, pr in zip(dests, regions, prices):
             if pr is None:
                 continue
             price = float(getattr(pr, "price", 0) or 0)
@@ -261,19 +288,18 @@ def add_one_way_deals(origin: str, region_name: str, state: dict, out: list):
             elif currency == "GBP": price_eur_value = price * 1.15
             else: price_eur_value = price
             destination = norm(getattr(d, "destination_name", "") or getattr(d, "destination", ""))
-            cabin = "Economy"
-            sc, reasons = one_way_score(price_eur_value, region_name, cabin, origin, destination)
+            sc, reasons = one_way_score(price_eur_value, region, label, origin, destination)
             if sc >= ALERT_THRESHOLD:
-                fp = f"OW|{origin}|{getattr(d,'destination','')}|{getattr(d,'departure_date','')}|{round(price,0)}"
+                fp = f"OW|{origin}|{getattr(d,'destination','')}|{getattr(d,'departure_date','')}|{label}|{round(price,0)}"
                 out.append((sc, {
                     "kind":"one-way", "fingerprint":fp, "origin":origin,
                     "destination":destination, "price":price, "currency":currency,
-                    "region":region_name, "cabin":cabin, "departure_date":getattr(d,'departure_date',''),
+                    "region":region, "cabin":label, "departure_date":getattr(d,'departure_date',''),
                     "return_date":"", "reasons":reasons,
                 }))
-        print(f"{origin} {region_name}: {len(dests)} One-Way-Ziele geprüft")
+        print(f"{origin} {label}: {len(dests)} One-Way-Ziele geprüft")
     except Exception as exc:
-        print(f"{origin} {region_name}: One-Way FEHLER {type(exc).__name__}: {exc}")
+        print(f"{origin} {label}: One-Way FEHLER {type(exc).__name__}: {exc}")
 
 
 def format_one_way_alarm(d: dict, sc: int):
@@ -319,15 +345,15 @@ def main():
         if sc >= ALERT_THRESHOLD:
             candidates.append((sc, d, reasons, "roundtrip"))
 
-    # One-way: staggered to avoid hammering Google. Two origins per run, one region;
-    # state rotates through all origin/region combinations over subsequent runs.
-    regions = ["Asien", "Afrika", "Langstrecke"]
+    # One-way: rotate through origin + cabin combinations. We deliberately avoid
+    # swoop's region filter (see add_one_way_deals) and classify destinations locally.
+    jobs = [(o, c) for o in ORIGINS for c in ONE_WAY_CABINS]
     cursor = int(state.get("one_way_cursor", 0))
-    jobs = [(o, r) for o in ORIGINS for r in regions]
-    selected = [jobs[(cursor + i) % len(jobs)] for i in range(ORIGIN_BATCH_SIZE)]
-    state["one_way_cursor"] = (cursor + ORIGIN_BATCH_SIZE) % len(jobs)
-    for origin, region_name in selected:
-        add_one_way_deals(origin, region_name, state, one_way)
+    selected = [jobs[(cursor + i) % len(jobs)] for i in range(ONE_WAY_JOB_BATCH)]
+    state["one_way_cursor"] = (cursor + ONE_WAY_JOB_BATCH) % len(jobs)
+    for origin, cabin in selected:
+        add_one_way_deals(origin, cabin, one_way)
+        time.sleep(0.35)
 
     for sc, d in one_way:
         if d["fingerprint"] not in seen:
